@@ -8,38 +8,68 @@ Rust AV compositing engine — a Resolume-inspired real-time video playback and 
 crates/
 ├── core/          types       AvError, VideoFrame
 ├── playback/      decode      FFmpeg 8 decoder, drain-on-EOF, real PTS
-├── compositor/    GPU         wgpu surface, sRGB pipeline, letterboxed quad
-└── app/           binary      winit + egui UI, play/pause/loop/seek/speed
+├── compositor/    GPU         GpuContext + VideoPipeline + VideoTexture + WindowSurface
+└── app/           binary      winit + egui — control window + clean output window
 ```
 
-**Data flow:** `Decoder::next_frame() → VideoFrame → Engine::upload_frame() → draw_video → egui overlay → present`
+**GPU model:** one `GpuContext` (instance + adapter + device + queue) and one `VideoTexture` are shared across both windows. Each `WindowSurface` owns its own letterbox uniform + bind group, which it rebuilds automatically when the texture is reallocated.
+
+**Per-tick flow:** `about_to_wait → decoder.next_frame → VideoTexture::upload (once) → both windows request_redraw → each window prepare_video + draw_video + (control window also: egui)`.
 
 ## Quick start
 
 ```bash
 brew install ffmpeg@8
 
+# Open with one or more clips. The first clip auto-activates so the
+# output isn't black.
 PKG_CONFIG_PATH="/opt/homebrew/opt/ffmpeg@8/lib/pkgconfig" \
-  cargo run --release -- video.mp4
+  cargo run --release -- clip1.mp4 clip2.mp4 clip3.mp4
+
+# Open the output window fullscreen on monitor 1 (e.g. a projector).
+PKG_CONFIG_PATH="..." cargo run --release -- \
+  --output-monitor 1 --fullscreen sample.mp4
+
+# Discover monitors:
+PKG_CONFIG_PATH="..." cargo run --release -- --list-monitors
 ```
+
+Drag video files onto the control window to add them to the library.
 
 `RUST_LOG=debug` enables verbose tracing output.
 
-**Controls:** Space = play/pause · R = restart · Esc = quit
+## Two-window UX
+
+- **Control window** (`avengine — control`): clip library on the left, transport bar on top, output settings on the right, status bar on bottom. The video plays as a letterboxed preview behind the translucent panels.
+- **Output window** (`avengine — output`): clean video, no overlay. Drag it to a projector and press `F` (or tick `Fullscreen`).
+
+**Shortcuts:**
+
+| key   | window  | action                                            |
+|-------|---------|---------------------------------------------------|
+| Space | both    | play / pause active deck                          |
+| R     | both    | restart active deck                               |
+| F     | both    | toggle output-window fullscreen                   |
+| M     | both    | cycle output to the next monitor                  |
+| H     | control | hide / show the UI overlay                        |
+| Esc   | output  | exit fullscreen                                   |
+| Esc   | control | quit the app                                      |
 
 ## Design notes
 
-- **Color**: video frames are uploaded as `Rgba8UnormSrgb` and rendered into an sRGB surface, so the GPU does sRGB↔linear conversion symmetrically and egui's sRGB-aware shader matches.
-- **Aspect ratio**: a small uniform passes per-axis NDC scale to the vertex shader; videos are letterboxed/pillarboxed instead of stretched.
-- **Decoder**: follows the canonical FFmpeg send-packet / receive-frame loop with `send_eof` + drain on end-of-stream, so frames buffered for B-frame reordering are not dropped.
-- **Frame rate**: read from the container (`avg_frame_rate`, falling back to `r_frame_rate`); a per-render wall-clock accumulator is clamped to 250 ms so the app doesn't burst-decode after a stall.
+- **Color**: video uploaded as `Rgba8UnormSrgb`, surface picked sRGB. The GPU does symmetric sRGB↔linear conversion so colors match egui's pipeline.
+- **Aspect ratio**: per-window `scale: vec2<f32>` uniform driven by `letterbox_scale(video, surface)` keeps the video correctly framed in both the (probably 16:10 laptop) control window and the (probably 16:9 projector) output window.
+- **Decoder**: canonical FFmpeg send-packet / receive-frame loop with `send_eof` + drain at end-of-stream so B-frames buffered for reordering aren't dropped. Frame rate is read from the container.
+- **Catch-up cap**: per-tick wall-clock delta is clamped to 250 ms so an unfocused window doesn't burst-decode dozens of frames on resume.
 - **Errors**: libs use `AvError` (`thiserror`); the binary uses `anyhow` at the boundary. Surface acquisition handles `Lost`/`Outdated`/`Timeout` instead of panicking.
+- **`unsafe` count**: zero in our code (the original `mem::transmute` for the egui pass was replaced by `RenderPass::forget_lifetime()`).
 
 ## Roadmap
 
-- [ ] Decode on a worker thread with a bounded frame channel (current decode is on the render thread)
-- [ ] Layer stack (multiple clips, z-ordered, crossfade) — `Layer` trait + per-layer `Rect`, opacity, blend mode
-- [ ] Blend mode pipelines (add, multiply, screen) — one render pipeline per `wgpu::BlendState`
+- [ ] Decode on a worker thread with a bounded frame channel (today the decoder runs on the main thread; fine for one 1080p clip, will choke on 4K or multi-clip)
+- [ ] Native file picker for "Open files…" (currently drag-drop only — needs `rfd`)
+- [ ] Layer stack: multiple simultaneous decks with z-order, opacity, blend mode
+- [ ] Blend mode pipelines (add, multiply, screen) — one `RenderPipeline` per `wgpu::BlendState`
 - [ ] GPU-side YUV→RGB conversion (skip the FFmpeg software scaler hot path)
 - [ ] Effects pipeline (brightness, contrast, HSV, chroma key)
 - [ ] Audio decode + FFT beat detection
