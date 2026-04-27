@@ -1,0 +1,8 @@
+[package]
+name = "avengine-playback"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avengine-core = { path = "../core" }
+ffmpeg-next = "7"

@@ -1,0 +1,6 @@
+target/
+*.mp4
+*.mov
+*.avi
+*.mkv
+.DS_Store
