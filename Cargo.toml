@@ -1,3 +1,36 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jakubzygmunt/sublyve"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+avengine-core = { path = "crates/core" }
+avengine-playback = { path = "crates/playback" }
+avengine-compositor = { path = "crates/compositor" }
+
+wgpu = "23"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+ffmpeg-next = "8"
+egui = "0.30"
+egui-wgpu = "0.30"
+egui-winit = "0.30"
+
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

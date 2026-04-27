@@ -1,20 +1,28 @@
 [package]
 name = "avengine-app"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "avengine"
 path = "src/main.rs"
 
 [dependencies]
-avengine-core = { path = "../core" }
-avengine-playback = { path = "../playback" }
-avengine-compositor = { path = "../compositor" }
-wgpu = "23"
-winit = "0.30"
-egui = "0.30"
-egui-wgpu = "0.30"
-egui-winit = "0.30"
-bytemuck = { version = "1", features = ["derive"] }
-pollster = "0.4"
+avengine-core.workspace = true
+avengine-playback.workspace = true
+avengine-compositor.workspace = true
+
+wgpu.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+pollster.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

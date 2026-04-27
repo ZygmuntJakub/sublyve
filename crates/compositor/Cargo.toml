@@ -1,11 +1,16 @@
 [package]
 name = "avengine-compositor"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-avengine-core = { path = "../core" }
-wgpu = "23"
-winit = "0.30"
-bytemuck = { version = "1", features = ["derive"] }
-pollster = "0.4"
+avengine-core.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+tracing.workspace = true

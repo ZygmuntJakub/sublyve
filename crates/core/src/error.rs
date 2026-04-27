@@ -1,37 +1,40 @@
-use std::fmt;
+use std::io;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AvError {
-    Io(std::io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("decode error: {0}")]
     Decode(String),
+
+    #[error("ffmpeg error: {0}")]
     Ffmpeg(String),
-    Wgpu(String),
+
+    #[error("gpu error: {0}")]
+    Gpu(String),
+
+    #[error("invalid state: {0}")]
     InvalidState(String),
 }
 
-impl fmt::Display for AvError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AvError::Io(e) => write!(f, "I/O error: {e}"),
-            AvError::Decode(s) => write!(f, "decode error: {s}"),
-            AvError::Ffmpeg(s) => write!(f, "ffmpeg error: {s}"),
-            AvError::Wgpu(s) => write!(f, "wgpu error: {s}"),
-            AvError::InvalidState(s) => write!(f, "invalid state: {s}"),
-        }
+impl AvError {
+    /// Wraps any displayable error into `AvError::Ffmpeg`. Useful for
+    /// `.map_err(AvError::ffmpeg)` against `ffmpeg_next::Error` without
+    /// having to depend on FFmpeg from this crate.
+    pub fn ffmpeg<E: std::fmt::Display>(err: E) -> Self {
+        Self::Ffmpeg(err.to_string())
     }
-}
 
-impl std::error::Error for AvError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            AvError::Io(e) => Some(e),
-            _ => None,
-        }
+    pub fn gpu<E: std::fmt::Display>(err: E) -> Self {
+        Self::Gpu(err.to_string())
     }
-}
 
-impl From<std::io::Error> for AvError {
-    fn from(e: std::io::Error) -> Self {
-        AvError::Io(e)
+    pub fn decode<S: Into<String>>(msg: S) -> Self {
+        Self::Decode(msg.into())
+    }
+
+    pub fn invalid_state<S: Into<String>>(msg: S) -> Self {
+        Self::InvalidState(msg.into())
     }
 }

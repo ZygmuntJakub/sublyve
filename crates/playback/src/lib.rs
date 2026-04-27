@@ -1,7 +1,7 @@
-pub mod clip;
+//! CPU-side video playback: FFmpeg-backed decoding and a transport clock.
+
 pub mod decoder;
 pub mod transport;
 
-pub use clip::Clip;
-pub use decoder::Decoder;
+pub use decoder::{Decoder, StreamInfo};
 pub use transport::Transport;

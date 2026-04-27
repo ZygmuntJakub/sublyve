@@ -1,9 +1,11 @@
-pub mod color;
+//! Foundational types shared across the avengine crates.
+//!
+//! `core` deliberately has no dependency on FFmpeg or wgpu — it is the
+//! vocabulary that the playback (CPU-side decode) and compositor (GPU-side
+//! upload/render) crates communicate in.
+
 pub mod error;
 pub mod frame;
-pub mod rect;
 
-pub use color::{BlendMode, Rgba};
 pub use error::AvError;
-pub use frame::{AudioFrame, VideoFrame};
-pub use rect::Rect;
+pub use frame::VideoFrame;
