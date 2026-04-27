@@ -33,7 +33,19 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// Open a decoder that emits frames at native source resolution.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, AvError> {
+        Self::open_scaled(path, None)
+    }
+
+    /// Open a decoder that resamples each output frame to `target_size` via
+    /// FFmpeg's software scaler. Used by the thumbnail extractor to get a
+    /// 320×180 (or whatever) frame in one pass without a separate CPU
+    /// resize step.
+    pub fn open_scaled<P: AsRef<Path>>(
+        path: P,
+        target_size: Option<(u32, u32)>,
+    ) -> Result<Self, AvError> {
         ffmpeg::init().map_err(AvError::ffmpeg)?;
 
         let input = ffmpeg::format::input(&path).map_err(AvError::ffmpeg)?;
@@ -49,13 +61,17 @@ impl Decoder {
             .map_err(AvError::ffmpeg)?;
         let decoder = codec_ctx.decoder().video().map_err(AvError::ffmpeg)?;
 
+        let (target_w, target_h) = target_size
+            .map(|(w, h)| (w.max(1), h.max(1)))
+            .unwrap_or((decoder.width(), decoder.height()));
+
         let scaler = ffmpeg::software::scaling::context::Context::get(
             decoder.format(),
             decoder.width(),
             decoder.height(),
             ffmpeg::format::Pixel::RGBA,
-            decoder.width(),
-            decoder.height(),
+            target_w,
+            target_h,
             ffmpeg::software::scaling::Flags::BILINEAR,
         )
         .map_err(AvError::ffmpeg)?;

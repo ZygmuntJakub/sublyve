@@ -188,6 +188,7 @@ dependencies = [
  "avengine-compositor",
  "avengine-core",
  "avengine-playback",
+ "bytemuck",
  "clap",
  "egui",
  "egui-wgpu",

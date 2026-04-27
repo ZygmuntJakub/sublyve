@@ -1,8 +1,10 @@
 struct Uniforms {
-    // Per-axis scale applied in NDC. Values <= 1.0 letterbox the quad
-    // so the source video keeps its aspect ratio inside the surface.
+    // NDC scale for letterbox/pillarbox.
     scale: vec2<f32>,
-    _pad: vec2<f32>,
+    // Per-layer opacity, applied to the source alpha so every blend mode
+    // honours the layer's opacity slider uniformly.
+    opacity: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var t_diffuse: texture_2d<f32>;
@@ -29,5 +31,9 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_diffuse, s_diffuse, in.uv);
+    // Output premultiplied alpha so the fixed-function blend states in
+    // VideoPipelines compute the correct formula for every BlendMode.
+    let s = textureSample(t_diffuse, s_diffuse, in.uv);
+    let a = s.a * u.opacity;
+    return vec4<f32>(s.rgb * a, a);
 }

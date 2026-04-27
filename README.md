@@ -6,72 +6,89 @@ Rust AV compositing engine — a Resolume-inspired real-time video playback and 
 
 ```
 crates/
-├── core/          types       AvError, VideoFrame
-├── playback/      decode      FFmpeg 8 decoder, drain-on-EOF, real PTS
-├── compositor/    GPU         GpuContext + VideoPipeline + VideoTexture + WindowSurface
-└── app/           binary      winit + egui — control window + clean output window
+├── core/          types       AvError, BlendMode, VideoFrame
+├── playback/      decode      FFmpeg 8 decoder (drain-on-EOF, real PTS, scaled-output)
+├── compositor/    GPU         GpuContext + VideoPipelines (per blend mode)
+│                              + VideoTexture + CompositionTarget + Thumbnail + WindowSurface
+└── app/           binary      winit + egui — control window with grid/preview/cue/Take
+                              + clean fullscreen output window
+                              Library (2D grid) · Layer · Composition · thumbs
 ```
 
-**GPU model:** one `GpuContext` (instance + adapter + device + queue) and one `VideoTexture` are shared across both windows. Each `WindowSurface` owns its own letterbox uniform + bind group, which it rebuilds automatically when the texture is reallocated.
-
-**Per-tick flow:** `about_to_wait → decoder.next_frame → VideoTexture::upload (once) → both windows request_redraw → each window prepare_video + draw_video + (control window also: egui)`.
+**Composition model.** Every layer (`Layer`) owns its own `Decoder + Transport + VideoTexture`. On each tick, every layer pulls a frame, then `Composition::render` draws all visible layers — back-to-front — into a shared offscreen `CompositionTarget` (default `1920×1080`, sRGB). Each `WindowSurface` then blits the composition target to its surface, letterboxed to fit. Result: one decode + one composition per tick, two surfaces drawing the same composition.
 
 ## Quick start
 
 ```bash
 brew install ffmpeg@8
 
-# Open with one or more clips. The first clip auto-activates so the
-# output isn't black.
+# Default: 4 layers × 8 columns. First arg gets pre-loaded into (0, 0).
 PKG_CONFIG_PATH="/opt/homebrew/opt/ffmpeg@8/lib/pkgconfig" \
-  cargo run --release -- clip1.mp4 clip2.mp4 clip3.mp4
+  cargo run --release -- sample.mp4
 
-# Open the output window fullscreen on monitor 1 (e.g. a projector).
+# Custom grid + composition resolution + projector setup:
 PKG_CONFIG_PATH="..." cargo run --release -- \
-  --output-monitor 1 --fullscreen sample.mp4
+  --layers 6 --columns 10 \
+  --composition-size 1920x1080 \
+  --output-monitor 1 --fullscreen \
+  clip1.mp4 clip2.mp4 clip3.mp4
 
 # Discover monitors:
 PKG_CONFIG_PATH="..." cargo run --release -- --list-monitors
 ```
 
-Drag video files onto the control window to add them to the library.
+Drag video files onto cells in the grid to add them to the library. `RUST_LOG=debug` enables verbose tracing.
 
-`RUST_LOG=debug` enables verbose tracing output.
+## UI
 
-## Two-window UX
+Two windows:
 
-- **Control window** (`avengine — control`): clip library on the left, transport bar on top, output settings on the right, status bar on bottom. The video plays as a letterboxed preview behind the translucent panels.
-- **Output window** (`avengine — output`): clean video, no overlay. Drag it to a projector and press `F` (or tick `Fullscreen`).
+- **Control** (`avengine — control`) — top transport bar; central clip grid (rows = layers, cols = columns); left panel with the live **Output** preview, the **Cue** preview, the **TAKE** button, and Output settings (monitor + fullscreen); right panel with the **Layer settings** for whichever layer you've selected (click an `L0`/`L1`/… row label on the left of the grid).
+- **Output** (`avengine — output`) — clean composition, no overlay. Drag onto a projector and press `F`.
+
+**Click semantics.**
+
+- **Click** a cell → trigger that clip on its layer (loads + plays immediately).
+- **Shift+click** a cell → cue it: the clip plays on a hidden preview deck so you can preview it in the **Cue** pane without sending it to output. The TAKE button (or `Enter`) then promotes the cued clip to its real layer.
+- **Right-click** a cell → stop the layer that owns the cell.
+- **Double-click** is the same as click (kept for muscle memory).
+- **Drag** a video file onto a cell → import it into that cell. If the cell's layer is currently empty, the new clip auto-triggers on it.
+
+Triggering a clip auto-selects its layer in the right-hand inspector.
 
 **Shortcuts:**
 
-| key   | window  | action                                            |
-|-------|---------|---------------------------------------------------|
-| Space | both    | play / pause active deck                          |
-| R     | both    | restart active deck                               |
-| F     | both    | toggle output-window fullscreen                   |
-| M     | both    | cycle output to the next monitor                  |
-| H     | control | hide / show the UI overlay                        |
-| Esc   | output  | exit fullscreen                                   |
-| Esc   | control | quit the app                                      |
+| key   | window  | action                                                           |
+|-------|---------|------------------------------------------------------------------|
+| Space | both    | toggle composition play/pause (every loaded layer)               |
+| R     | both    | restart every layer                                              |
+| Enter | both    | Take the cued clip                                               |
+| F     | both    | toggle output-window fullscreen                                  |
+| M     | both    | cycle output to next monitor                                     |
+| Esc   | output  | leave fullscreen                                                 |
+| Esc   | control | clear cue (or quit if nothing cued)                              |
 
 ## Design notes
 
-- **Color**: video uploaded as `Rgba8UnormSrgb`, surface picked sRGB. The GPU does symmetric sRGB↔linear conversion so colors match egui's pipeline.
-- **Aspect ratio**: per-window `scale: vec2<f32>` uniform driven by `letterbox_scale(video, surface)` keeps the video correctly framed in both the (probably 16:10 laptop) control window and the (probably 16:9 projector) output window.
-- **Decoder**: canonical FFmpeg send-packet / receive-frame loop with `send_eof` + drain at end-of-stream so B-frames buffered for reordering aren't dropped. Frame rate is read from the container.
-- **Catch-up cap**: per-tick wall-clock delta is clamped to 250 ms so an unfocused window doesn't burst-decode dozens of frames on resume.
-- **Errors**: libs use `AvError` (`thiserror`); the binary uses `anyhow` at the boundary. Surface acquisition handles `Lost`/`Outdated`/`Timeout` instead of panicking.
-- **`unsafe` count**: zero in our code (the original `mem::transmute` for the egui pass was replaced by `RenderPass::forget_lifetime()`).
+- **Premultiplied alpha throughout.** The fragment shader emits `vec4(rgb * a, a)` where `a = src.a * opacity`, so the four blend states (`Normal`, `Add`, `Multiply`, `Screen`) all behave correctly under the per-layer opacity slider with no per-mode shader branching.
+- **One pipeline per blend mode.** Switching modes is a `set_pipeline` call, not a uniform tweak; blend state is baked into the pipeline.
+- **Composition target is fixed.** The output surface blits the composition target letterboxed to fit. The control window samples the same texture inside an egui `Image` for the live Output preview pane (registered once via `egui_wgpu::Renderer::register_native_texture`). Resizing windows doesn't reallocate GPU memory; only `--composition-size` does.
+- **One decoder per layer (V1: main thread).** `Layer::tick` runs each layer's send-packet / receive-frame loop with `send_eof` + drain. Frame rate is read from each clip's container (`avg_frame_rate`).
+- **Sync decode budget.** ~5 ms per layer per frame on Apple silicon for 1080p H.264 → 4 layers @ 30 fps comfortably hits vsync. 60 fps clips, 4K layers, or 6+ layers will start dropping frames; threaded decode is the next milestone.
+- **Color.** Video uploaded as `Rgba8UnormSrgb`, composition target same, surface picked sRGB. Symmetric sRGB↔linear at every stage; matches egui's pipeline.
+- **`unsafe` count.** Zero in our code. The egui render-pass crossing uses `RenderPass::forget_lifetime`.
+- **Errors.** Libs use `AvError` (`thiserror`); the binary uses `anyhow` at the boundary. Surface acquisition handles `Lost`/`Outdated`/`Timeout` instead of panicking.
 
 ## Roadmap
 
-- [ ] Decode on a worker thread with a bounded frame channel (today the decoder runs on the main thread; fine for one 1080p clip, will choke on 4K or multi-clip)
-- [ ] Native file picker for "Open files…" (currently drag-drop only — needs `rfd`)
-- [ ] Layer stack: multiple simultaneous decks with z-order, opacity, blend mode
-- [ ] Blend mode pipelines (add, multiply, screen) — one `RenderPipeline` per `wgpu::BlendState`
-- [ ] GPU-side YUV→RGB conversion (skip the FFmpeg software scaler hot path)
-- [ ] Effects pipeline (brightness, contrast, HSV, chroma key)
-- [ ] Audio decode + FFT beat detection
-- [ ] NDI / Syphon output
-- [ ] Projection mapping (mesh warp)
+- [ ] **Threaded decode** — one worker per layer with a bounded frame channel. Mandatory before pushing past ~4×1080p layers or any 60 fps content.
+- [ ] Per-clip transform (Position X/Y, Scale, Rotate) — Resolume parameter inspector parity.
+- [ ] Column launch (one shortcut triggers every layer at column N).
+- [ ] Native file picker (replace the drag-drop-only flow).
+- [ ] Solo (alongside the existing Mute).
+- [ ] More blend modes — `Overlay` needs a custom shader, not a fixed-function blend state.
+- [ ] Composition save/load.
+- [ ] Effects pipeline (brightness, contrast, HSV, chroma key) — render targets per layer chain through effect passes.
+- [ ] Audio decode + FFT beat detection + BPM sync.
+- [ ] NDI / Syphon output.
+- [ ] Projection mapping (mesh warp).

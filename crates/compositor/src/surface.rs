@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use avengine_core::AvError;
+use avengine_core::{AvError, BlendMode};
 use tracing::{debug, warn};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::composition::CompositionTarget;
 use crate::gpu::GpuContext;
-use crate::pipeline::{Uniforms, VideoPipeline};
-use crate::video_texture::VideoTexture;
+use crate::pipeline::{Uniforms, VideoPipelines};
 
 pub enum AcquiredFrame {
     Ready(wgpu::SurfaceTexture),
@@ -15,8 +15,13 @@ pub enum AcquiredFrame {
 }
 
 /// A drawable window: owns the wgpu `Surface`, its config, and the
-/// per-window letterbox uniform. Bind groups are rebuilt lazily whenever
-/// the shared `VideoTexture` is reallocated (size change).
+/// per-window letterbox uniform.
+///
+/// Each `WindowSurface` blits the shared `CompositionTarget` to its
+/// surface — the actual layer compositing happens off-screen into the
+/// composition target by `Composition::render`. The bind group is
+/// rebuilt whenever the composition target's `generation` bumps
+/// (resize/realloc).
 pub struct WindowSurface {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -24,8 +29,8 @@ pub struct WindowSurface {
 
     uniforms_buffer: wgpu::Buffer,
     bind_group: Option<wgpu::BindGroup>,
-    /// `VideoTexture::generation()` value that `bind_group` was built for.
-    /// `u64::MAX` means "never built". Mismatch triggers a rebuild.
+    /// `CompositionTarget::generation` value the current `bind_group` was
+    /// built for. `u64::MAX` means "never built".
     bound_generation: u64,
 }
 
@@ -61,7 +66,7 @@ impl WindowSurface {
 
         let uniforms_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("avengine.surface.uniforms"),
-            contents: bytemuck::bytes_of(&Uniforms { scale: [1.0, 1.0], _pad: [0.0; 2] }),
+            contents: bytemuck::bytes_of(&Uniforms::new([1.0, 1.0], 1.0)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -113,38 +118,33 @@ impl WindowSurface {
     }
 
     /// Refresh the per-window letterbox uniform and rebuild the bind group
-    /// if the shared video texture has been reallocated. Call once per
-    /// frame before `draw_video`.
-    pub fn prepare_video(
+    /// if the composition target has been reallocated. Call once per frame
+    /// before `draw_composition`.
+    pub fn prepare_blit(
         &mut self,
         gpu: &GpuContext,
-        pipeline: &VideoPipeline,
-        video: &VideoTexture,
+        pipelines: &VideoPipelines,
+        target: &CompositionTarget,
     ) {
-        let scale = letterbox_scale(
-            video.size().0,
-            video.size().1,
-            self.config.width,
-            self.config.height,
-        );
+        let scale = letterbox_scale(target.size.0, target.size.1, self.config.width, self.config.height);
         gpu.queue.write_buffer(
             &self.uniforms_buffer,
             0,
-            bytemuck::bytes_of(&Uniforms { scale, _pad: [0.0; 2] }),
+            bytemuck::bytes_of(&Uniforms::new(scale, 1.0)),
         );
 
-        if self.bound_generation != video.generation() || self.bind_group.is_none() {
+        if self.bound_generation != target.generation || self.bind_group.is_none() {
             self.bind_group = Some(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("avengine.surface.bind_group"),
-                layout: &pipeline.bind_group_layout,
+                layout: &pipelines.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(video.view()),
+                        resource: wgpu::BindingResource::TextureView(&target.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                        resource: wgpu::BindingResource::Sampler(&pipelines.sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -152,17 +152,20 @@ impl WindowSurface {
                     },
                 ],
             }));
-            self.bound_generation = video.generation();
+            self.bound_generation = target.generation;
         }
     }
 
-    pub fn draw_video(&self, rpass: &mut wgpu::RenderPass<'_>, pipeline: &VideoPipeline) {
+    /// Draw one fullscreen quad sampling the composition target. Always
+    /// uses `BlendMode::Normal` since the composition target already has
+    /// the correct premultiplied result.
+    pub fn draw_composition(&self, rpass: &mut wgpu::RenderPass<'_>, pipelines: &VideoPipelines) {
         let Some(bg) = self.bind_group.as_ref() else {
             return;
         };
-        rpass.set_pipeline(&pipeline.pipeline);
+        rpass.set_pipeline(pipelines.pipeline_for(BlendMode::Normal));
         rpass.set_bind_group(0, bg, &[]);
-        rpass.set_vertex_buffer(0, pipeline.vertex_buffer.slice(..));
+        rpass.set_vertex_buffer(0, pipelines.vertex_buffer.slice(..));
         rpass.draw(0..6, 0..1);
     }
 }
@@ -175,7 +178,7 @@ fn pick_surface_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat 
         .unwrap_or(caps.formats[0])
 }
 
-/// Per-axis NDC scale so a `(vw, vh)` video fits inside an `(sw, sh)`
+/// Per-axis NDC scale so a `(vw, vh)` source fits inside an `(sw, sh)`
 /// surface while preserving aspect ratio (letterbox/pillarbox).
 fn letterbox_scale(vw: u32, vh: u32, sw: u32, sh: u32) -> [f32; 2] {
     if vw == 0 || vh == 0 || sw == 0 || sh == 0 {
