@@ -4,8 +4,7 @@
 /// is made by `pipeline_for(BlendMode)`. `Overlay` is intentionally absent
 /// — it needs a custom shader rather than a fixed-function blend state, so
 /// it'll land alongside the effects pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     #[default]
     Normal,

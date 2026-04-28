@@ -1,7 +1,9 @@
 mod audio;
 mod composition;
+mod config;
 mod layer;
 mod library;
+mod project;
 mod thumbs;
 mod ui;
 
@@ -81,6 +83,20 @@ struct Cli {
     /// List available audio output devices and exit.
     #[arg(long)]
     list_audio_devices: bool,
+
+    /// Don't auto-load the last-used project on startup. The CLI's
+    /// positional `clips` and the `--composition-size` etc. take
+    /// precedence over the saved project anyway; this flag is for the
+    /// rarer case of "open me with a fresh empty workspace" while
+    /// still leaving the saved last-project alone.
+    #[arg(long)]
+    no_resume: bool,
+
+    /// Open this project file directly instead of the last-used one.
+    /// Implies `--no-resume`. Mutually exclusive with positional
+    /// clip arguments.
+    #[arg(long, value_name = "FILE")]
+    project: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -247,6 +263,10 @@ struct AppState {
 
     /// Audio output engine. Holds the cpal stream + per-layer mixer.
     audio_engine: audio::AudioEngine,
+
+    /// Persistent app preferences. Mutated whenever the user saves
+    /// or opens a project so the next launch can resume.
+    config: config::AppConfig,
 }
 
 struct ControlWindow {
@@ -391,6 +411,8 @@ impl AppState {
         // Preview deck has no audio output — it only feeds the Cue pane.
         let preview = Layer::new_silent(&gpu);
 
+        let app_config = config::AppConfig::load();
+
         let mut state = Self {
             gpu,
             composition_pipelines,
@@ -412,25 +434,57 @@ impl AppState {
             composition_egui_id: None,
             bound_composition_gen: u64::MAX,
             audio_engine,
+            config: app_config,
         };
 
-        // Preload CLI clips into row 0 left-to-right, activating the first
-        // one on layer 0 so the user sees something immediately.
-        for path in &cli.clips {
-            if let Some((row, col)) = state.library.first_empty() {
-                if let Err(e) = state.import_clip(path.clone(), row, col) {
-                    error!("failed to import {}: {e:#}", path.display());
+        // Decide whether to auto-load a project. CLI args win over the
+        // saved last-project so a user invoking `cargo run -- foo.mp4`
+        // gets exactly that, not their previous workspace.
+        let project_to_load: Option<PathBuf> = if let Some(p) = cli.project.clone() {
+            Some(p)
+        } else if !cli.no_resume && cli.clips.is_empty() {
+            state.config.last_project.clone()
+        } else {
+            None
+        };
+
+        if let Some(path) = project_to_load {
+            match project::load_from_path(&path) {
+                Ok(project) => {
+                    if let Err(e) = state.apply_project(project) {
+                        warn!("failed to apply project from {}: {e:#}", path.display());
+                    } else {
+                        info!("auto-loaded project ← {}", path.display());
+                        state.config.remember_project(&path);
+                    }
                 }
-            } else {
-                warn!("library full, skipping {}", path.display());
-                break;
+                Err(e) => {
+                    warn!("could not auto-load {}: {e:#}", path.display());
+                    if state.config.last_project.as_deref() == Some(path.as_path()) {
+                        state.config.last_project = None;
+                        let _ = state.config.save();
+                    }
+                }
             }
-        }
-        if let Some(slot) = state.library.cell(0, 0) {
-            let path = slot.path.clone();
-            let defaults = slot.defaults;
-            if let Err(e) = state.composition.layers[0].load(&state.gpu, &path, 0, defaults) {
-                error!("failed to load layer 0: {e:#}");
+        } else {
+            // CLI clips path: preload into row 0 left-to-right, then
+            // activate the first one on layer 0.
+            for path in &cli.clips {
+                if let Some((row, col)) = state.library.first_empty() {
+                    if let Err(e) = state.import_clip(path.clone(), row, col) {
+                        error!("failed to import {}: {e:#}", path.display());
+                    }
+                } else {
+                    warn!("library full, skipping {}", path.display());
+                    break;
+                }
+            }
+            if let Some(slot) = state.library.cell(0, 0) {
+                let path = slot.path.clone();
+                let defaults = slot.defaults;
+                if let Err(e) = state.composition.layers[0].load(&state.gpu, &path, 0, defaults) {
+                    error!("failed to load layer 0: {e:#}");
+                }
             }
         }
 
@@ -1068,6 +1122,60 @@ impl AppState {
         {
             slot.defaults.blend = blend;
         }
+
+        if actions.save_project
+            && let Err(e) = self.save_project_dialog() {
+                error!("project save failed: {e:#}");
+            }
+        if actions.open_project
+            && let Err(e) = self.open_project_dialog() {
+                error!("project load failed: {e:#}");
+            }
+    }
+
+    fn save_project_dialog(&mut self) -> Result<()> {
+        // Default the save dialog to the directory of whatever project
+        // is currently loaded, so re-saving puts the file next to its
+        // siblings instead of in `~`.
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save Sublyve project")
+            .add_filter("Sublyve project", &["sublyve.json", "json"])
+            .set_file_name("project.sublyve.json");
+        if let Some(parent) = self
+            .config
+            .last_project
+            .as_ref()
+            .and_then(|p| p.parent())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(path) = dialog.save_file() else { return Ok(()) };
+        let project = self.capture_project();
+        project::save_to_path(&project, &path)?;
+        info!("project saved → {}", path.display());
+        self.config.remember_project(&path);
+        Ok(())
+    }
+
+    fn open_project_dialog(&mut self) -> Result<()> {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open Sublyve project")
+            .add_filter("Sublyve project", &["sublyve.json", "json"])
+            .add_filter("All files", &["*"]);
+        if let Some(parent) = self
+            .config
+            .last_project
+            .as_ref()
+            .and_then(|p| p.parent())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(path) = dialog.pick_file() else { return Ok(()) };
+        let project = project::load_from_path(&path)?;
+        self.apply_project(project)?;
+        info!("project loaded ← {}", path.display());
+        self.config.remember_project(&path);
+        Ok(())
     }
 
     /// Open a native file dialog and import the picked file into
@@ -1085,6 +1193,175 @@ impl AppState {
         let Some(path) = picked else { return };
         if let Err(e) = self.import_clip(path, row, col) {
             error!("import failed: {e:#}");
+        }
+    }
+
+    /// Reset every layer + drop the entire library, freeing per-clip
+    /// egui textures along the way. Used as the first step of
+    /// `apply_project` so the load starts from a clean slate.
+    fn clear_workspace(&mut self) {
+        // Clear the cue + preview deck so we don't leak references to
+        // a slot that's about to be discarded.
+        self.clear_cue();
+        for layer in self.composition.layers.iter_mut() {
+            layer.clear();
+        }
+        let layers = self.library.layers();
+        let cols = self.library.columns();
+        for r in 0..layers {
+            for c in 0..cols {
+                if let Some(prev) = self.library.clear(r, c)
+                    && let Some(id) = prev.thumbnail_id
+                {
+                    self.control.egui_renderer.free_texture(&id);
+                }
+            }
+        }
+    }
+
+    /// Apply a loaded `project::Project` onto the live `AppState`.
+    /// Clears the existing workspace, then replays the saved spec —
+    /// importing each cell via `import_clip`, applying per-layer
+    /// settings, and reconfiguring output / audio.
+    fn apply_project(&mut self, project: project::Project) -> Result<()> {
+        self.clear_workspace();
+
+        // Resize the composition target if the project asks for a
+        // different size. The output window samples this; nothing
+        // else to recreate.
+        let want = (project.composition.width, project.composition.height);
+        if want != self.composition.target.size {
+            self.composition
+                .target
+                .resize(&self.gpu.device, want.0, want.1);
+            info!(
+                "composition resized to {}x{} on project load",
+                want.0, want.1
+            );
+        }
+
+        // Output: monitor + fullscreen. Monitor is best-effort by
+        // index — if the requested index is out of range now we just
+        // keep the current selection.
+        if project.output.monitor_index < self.monitors.len() {
+            self.set_output_monitor(project.output.monitor_index);
+        } else {
+            warn!(
+                "saved monitor index {} is out of range ({} monitors); keeping current",
+                project.output.monitor_index,
+                self.monitors.len()
+            );
+        }
+        self.set_output_fullscreen(project.output.fullscreen);
+
+        // Audio: device + master volume. Switch only if the saved
+        // device name differs from what's currently active.
+        self.audio_engine.set_master_volume(project.audio.master_volume);
+        if let Some(name) = project.audio.device_name.as_deref()
+            && self.audio_engine.current_device_name() != Some(name)
+                && let Err(e) = self
+                    .audio_engine
+                    .switch_device(&mut self.composition.layers, Some(name))
+                {
+                    warn!("could not switch to saved audio device {name:?}: {e:#}");
+                }
+
+        // Per-layer compositing settings. We apply these *before*
+        // importing clips so the right-panel inspector shows the
+        // right values immediately. Defaults from each cell are
+        // applied on the next trigger.
+        for spec in &project.layers {
+            let Some(layer) = self.composition.layers.get_mut(spec.index) else {
+                warn!(
+                    "saved layer index {} is out of range ({} layers); skipping",
+                    spec.index,
+                    self.composition.layers.len()
+                );
+                continue;
+            };
+            layer.blend_mode = spec.blend;
+            layer.opacity = spec.opacity;
+            layer.set_mute(spec.mute);
+            layer.set_audio_gain(spec.audio_gain);
+        }
+
+        // Library: import every saved cell. Each call decodes a
+        // thumbnail and registers it with egui — synchronous, so
+        // larger libraries take a moment.
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for cell in &project.library.cells {
+            if !cell.path.exists() {
+                warn!(
+                    "skipping missing clip at L{}/C{}: {}",
+                    cell.row,
+                    cell.col,
+                    cell.path.display()
+                );
+                skipped += 1;
+                continue;
+            }
+            match self.import_clip(cell.path.clone(), cell.row, cell.col) {
+                Ok(()) => {
+                    if let Some(slot) = self.library.cell_mut(cell.row, cell.col) {
+                        slot.defaults = cell.defaults;
+                    }
+                    imported += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        "failed to import {} into L{}/C{}: {e:#}",
+                        cell.path.display(),
+                        cell.row,
+                        cell.col
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+        info!(
+            "project loaded: {imported} cell(s) imported, {skipped} skipped"
+        );
+        Ok(())
+    }
+
+    /// Read-only snapshot of the workspace into a `project::Project`.
+    /// Active clips, transport state, and the cue are deliberately not
+    /// captured — see the project plan for the "setup, not snapshot"
+    /// rationale.
+    fn capture_project(&self) -> project::Project {
+        let layers = self
+            .composition
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(idx, l)| project::LayerSpec {
+                index: idx,
+                blend: l.blend_mode,
+                opacity: l.opacity,
+                mute: l.mute,
+                audio_gain: l.audio_gain(),
+            })
+            .collect();
+        project::Project {
+            composition: project::CompositionSpec {
+                width: self.composition.target.size.0,
+                height: self.composition.target.size.1,
+            },
+            library: project::LibrarySpec {
+                layers: self.library.layers(),
+                columns: self.library.columns(),
+                cells: project::collect_cells(&self.library),
+            },
+            layers,
+            output: project::OutputSpec {
+                monitor_index: self.output.selected_monitor,
+                fullscreen: self.is_output_fullscreen(),
+            },
+            audio: project::AudioSpec {
+                device_name: self.audio_engine.current_device_name().map(str::to_owned),
+                master_volume: self.audio_engine.master_volume(),
+            },
         }
     }
 }

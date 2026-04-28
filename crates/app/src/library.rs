@@ -8,7 +8,7 @@ use avengine_core::BlendMode;
 /// blend mode). Live edits in the right-hand layer inspector still take
 /// precedence until the next trigger; the defaults are what the clip
 /// "wants" by default.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClipDefaults {
     pub looping: bool,
     pub speed: f64,
@@ -105,11 +105,10 @@ impl Library {
         self.cells[i].replace(clip)
     }
 
-    /// Clear `(row, col)` and return the removed clip (if any). Used by
-    /// the test suite today; the UI route for "stop a clip" goes through
-    /// `Layer::clear` (which empties the layer) rather than removing the
-    /// library entry.
-    #[cfg(test)]
+    /// Clear `(row, col)` and return the removed clip (if any). The UI
+    /// route for "stop a clip" goes through `Layer::clear` (which
+    /// empties the layer); this is for project-load and any future
+    /// "remove clip" UI action.
     pub fn clear(&mut self, row: usize, col: usize) -> Option<ClipSlot> {
         let i = self.idx(row, col)?;
         self.cells[i].take()

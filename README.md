@@ -76,6 +76,34 @@ Triggering a clip auto-selects its layer in the right-hand inspector.
 | Esc   | output  | leave fullscreen                                                 |
 | Esc   | control | clear cue (or quit if nothing cued)                              |
 
+## Save / Load project
+
+`💾 Save…` and `📂 Open…` in the top transport bar persist the workspace as a JSON project file (`.sublyve.json`). The format is human-readable and version-stamped (`{ "version": 1, "project": { … } }`); the loader rejects newer versions with a clear error rather than misinterpreting fields.
+
+What's saved:
+
+- **Library cells**: every occupied `(row, col)` with its absolute path and per-clip defaults (loop / speed / blend).
+- **Per-layer compositing**: `blend_mode`, `opacity`, `mute`, `audio_gain` for every layer.
+- **Composition**: target width × height. Loading resizes the offscreen target if it differs.
+- **Output**: monitor index (best-effort by index across reboots), fullscreen flag.
+- **Audio**: device name, master volume.
+
+What's deliberately **not** saved (the file represents your *setup*, not a performance moment):
+
+- Active clip on each layer, transport position / playing / looping / speed — these come from the per-clip defaults on the next trigger.
+- Cue, hovered cell, selected layer.
+
+A "snapshot" / scene system that captures active state for choreographed recall is a deliberate future milestone — different concept from a project file.
+
+**Path policy**: absolute paths in V1. If a saved clip's source file has moved or been deleted, the loader logs a warning and skips that cell; the rest still load.
+
+**Auto-resume on startup**: launching with no arguments reopens the last project you saved or opened. Override with `--no-resume` (start with an empty workspace) or `--project /path/to/file.sublyve.json` (open that specific file). CLI clip arguments still win — `cargo run -- foo.mp4` always preloads `foo.mp4` and skips auto-resume.
+
+The last-project path lives in the OS config directory:
+- macOS: `~/Library/Application Support/sublyve/config.json`
+- Linux: `~/.config/sublyve/config.json`
+- Windows: `%APPDATA%\sublyve\config.json`
+
 ## Audio
 
 Each layer decodes both the video and audio streams of its clip in a single FFmpeg pass; audio is resampled to **48 kHz f32 stereo** and pushed into a per-layer SPSC ring buffer (`ringbuf 0.4`). A `cpal` output stream — opened on the default device or whichever `--audio-device` names — runs a real-time callback that pulls from every layer's buffer, multiplies by the per-layer gain, sums, and applies a master volume + clamp.
@@ -103,6 +131,9 @@ Audio + video are not yet PTS-locked — they share a wall-clock pump driven by 
 
 - [ ] **Threaded decode** — one worker per layer with a bounded frame channel. Mandatory before pushing past ~4×1080p layers or any 60 fps content.
 - [ ] **PTS-locked A/V sync** — drive layer playback off the audio stream's master clock so very long clips don't drift.
+- [ ] **Snapshots / scenes** — capture active clip + transport state per layer for choreographed recall. Different concept from a project file (which is the *setup*, not a moment).
+- [ ] **Recent files** menu and Cmd+S resaves to the current file.
+- [ ] **Project-relative paths** for portable bundles (zip the project file + clips together and move them between machines).
 - [ ] Per-clip transform (Position X/Y, Scale, Rotate) — Resolume parameter inspector parity.
 - [ ] Column launch (one shortcut triggers every layer at column N).
 - [ ] Native file picker (replace the drag-drop-only flow).

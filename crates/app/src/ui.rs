@@ -69,6 +69,10 @@ pub struct UiActions {
     pub set_layer_audio_gain: Option<(usize, f32)>,
     /// Switch the active output audio device to the named one.
     pub set_audio_device: Option<String>,
+    /// `💾 Save…` button — prompt for a path and save the project.
+    pub save_project: bool,
+    /// `📂 Open…` button — prompt for a path and load a project.
+    pub open_project: bool,
 }
 
 pub struct UiContext<'a> {
@@ -140,6 +144,13 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
         }
         if ui.button("⏮  Restart all").clicked() {
             actions.restart_composition = true;
+        }
+        ui.separator();
+        if ui.button("📂  Open…").clicked() {
+            actions.open_project = true;
+        }
+        if ui.button("💾  Save…").clicked() {
+            actions.save_project = true;
         }
         ui.separator();
         ui.label(format!(
