@@ -26,15 +26,17 @@ brew install ffmpeg@8
 PKG_CONFIG_PATH="/opt/homebrew/opt/ffmpeg@8/lib/pkgconfig" \
   cargo run --release -- sample.mp4
 
-# Custom grid + composition resolution + projector setup:
+# Custom grid + composition resolution + projector setup + audio:
 PKG_CONFIG_PATH="..." cargo run --release -- \
   --layers 6 --columns 10 \
   --composition-size 1920x1080 \
   --output-monitor 1 --fullscreen \
+  --audio-device "External Headphones" \
   clip1.mp4 clip2.mp4 clip3.mp4
 
-# Discover monitors:
+# Discover monitors / audio devices:
 PKG_CONFIG_PATH="..." cargo run --release -- --list-monitors
+PKG_CONFIG_PATH="..." cargo run --release -- --list-audio-devices
 ```
 
 Drag video files onto cells in the grid to add them to the library. `RUST_LOG=debug` enables verbose tracing.
@@ -74,6 +76,18 @@ Triggering a clip auto-selects its layer in the right-hand inspector.
 | Esc   | output  | leave fullscreen                                                 |
 | Esc   | control | clear cue (or quit if nothing cued)                              |
 
+## Audio
+
+Each layer decodes both the video and audio streams of its clip in a single FFmpeg pass; audio is resampled to **48 kHz f32 stereo** and pushed into a per-layer SPSC ring buffer (`ringbuf 0.4`). A `cpal` output stream — opened on the default device or whichever `--audio-device` names — runs a real-time callback that pulls from every layer's buffer, multiplies by the per-layer gain, sums, and applies a master volume + clamp.
+
+- **Per-layer audio gain** in the right-hand layer inspector (0.0 – 2.0).
+- **Per-layer mute** silences both video and audio.
+- **Master volume** in the left-panel Audio section.
+- **Device selection**: at startup via `--audio-device <name>` (use `--list-audio-devices` to discover names), or live from the left-panel **Audio · Output** combobox. Switching mid-session drops the active cpal stream, allocates fresh per-layer ring buffers (preserving each layer's gain / mute settings via the shared `Arc<AudioLayerControl>`), and builds a new stream — a brief audio gap, no app stall.
+- Clips with no audio stream are silently skipped on the audio side; their video plays normally.
+
+Audio + video are not yet PTS-locked — they share a wall-clock pump driven by the video frame rate, so they'll drift over very long clips. For tight A/V sync (PTS-driven master clock) see the roadmap.
+
 ## Design notes
 
 - **Premultiplied alpha throughout.** The fragment shader emits `vec4(rgb * a, a)` where `a = src.a * opacity`, so the four blend states (`Normal`, `Add`, `Multiply`, `Screen`) all behave correctly under the per-layer opacity slider with no per-mode shader branching.
@@ -88,6 +102,7 @@ Triggering a clip auto-selects its layer in the right-hand inspector.
 ## Roadmap
 
 - [ ] **Threaded decode** — one worker per layer with a bounded frame channel. Mandatory before pushing past ~4×1080p layers or any 60 fps content.
+- [ ] **PTS-locked A/V sync** — drive layer playback off the audio stream's master clock so very long clips don't drift.
 - [ ] Per-clip transform (Position X/Y, Scale, Rotate) — Resolume parameter inspector parity.
 - [ ] Column launch (one shortcut triggers every layer at column N).
 - [ ] Native file picker (replace the drag-drop-only flow).

@@ -3,11 +3,18 @@ use std::path::Path;
 use anyhow::Result;
 use avengine_compositor::{GpuContext, Uniforms, VideoPipelines, VideoTexture};
 use avengine_core::BlendMode;
-use avengine_playback::{Decoder, StreamInfo, Transport};
+use avengine_playback::{AudioConfig, Decoder, StreamInfo, Transport};
+use ringbuf::traits::Observer;
 use tracing::{error, warn};
 use wgpu::util::DeviceExt;
 
+use crate::audio::AudioLayerHandle;
 use crate::library::ClipDefaults;
+
+/// How aggressively the layer drains its decoder's pending audio
+/// samples into the SPSC ring buffer per `tick`. We try to keep the
+/// buffer at least half-full so the cpal callback never starves.
+const AUDIO_PUMP_TARGET_FILL: f32 = 0.5;
 
 /// One row of the grid: an independent decoder + transport that draws
 /// into the shared `CompositionTarget` with a chosen blend mode and
@@ -35,10 +42,36 @@ pub struct Layer {
     bind_group: Option<wgpu::BindGroup>,
 
     uniforms_buffer: wgpu::Buffer,
+
+    /// Producer side of the per-layer audio ring buffer. Decoded +
+    /// resampled samples land here via `tick`; the cpal callback drains
+    /// them. `None` for the preview deck (which doesn't route to output).
+    audio: Option<AudioLayerHandle>,
+    /// Engine audio config — used by `Layer::load` to open the decoder
+    /// with audio support matching the cpal stream.
+    audio_config: Option<AudioConfig>,
+    /// Scratch buffer reused across pumps to avoid per-tick allocs.
+    audio_scratch: Vec<f32>,
 }
 
 impl Layer {
-    pub fn new(gpu: &GpuContext) -> Self {
+    /// Build a layer with no audio routing. Used for the preview deck —
+    /// its frames go to the Cue pane but never to the output mixer.
+    pub fn new_silent(gpu: &GpuContext) -> Self {
+        Self::build(gpu, None, None)
+    }
+
+    /// Build a layer wired into the audio engine: decoded audio is
+    /// resampled to `audio_config` and pushed into `audio.producer`.
+    pub fn new(gpu: &GpuContext, audio: AudioLayerHandle, audio_config: AudioConfig) -> Self {
+        Self::build(gpu, Some(audio), Some(audio_config))
+    }
+
+    fn build(
+        gpu: &GpuContext,
+        audio: Option<AudioLayerHandle>,
+        audio_config: Option<AudioConfig>,
+    ) -> Self {
         let video_texture = VideoTexture::placeholder(&gpu.device);
         let uniforms_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("avengine.layer.uniforms"),
@@ -59,7 +92,35 @@ impl Layer {
             bound_video_gen: u64::MAX,
             bind_group: None,
             uniforms_buffer,
+            audio,
+            audio_config,
+            audio_scratch: Vec::new(),
         }
+    }
+
+    /// Per-layer audio gain (1.0 = unity). Routed through the audio
+    /// engine's atomic so the cpal callback picks it up without locks.
+    pub fn audio_gain(&self) -> f32 {
+        self.audio.as_ref().map_or(1.0, |a| a.control.gain())
+    }
+
+    pub fn set_audio_gain(&self, gain: f32) {
+        if let Some(a) = self.audio.as_ref() {
+            a.control.set_gain(gain.clamp(0.0, 4.0));
+        }
+    }
+
+    /// Hand back the layer's current audio control so a stream rebuild
+    /// can keep gain / mute settings stable across device switches.
+    pub fn audio_control(&self) -> Option<std::sync::Arc<crate::audio::AudioLayerControl>> {
+        self.audio.as_ref().map(|a| a.control.clone())
+    }
+
+    /// Swap in a new producer handle (after a stream rebuild) without
+    /// touching anything else on the layer. The caller is responsible
+    /// for keeping the matching consumer alive in the new cpal callback.
+    pub fn replace_audio_handle(&mut self, handle: AudioLayerHandle) {
+        self.audio = Some(handle);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -87,7 +148,13 @@ impl Layer {
         col: usize,
         defaults: ClipDefaults,
     ) -> Result<()> {
-        let mut decoder = Decoder::open(path)?;
+        // If we're wired into the audio engine, open with audio so the
+        // decoder demuxes both streams in a single pass; otherwise the
+        // existing video-only path keeps preview-deck loads cheap.
+        let mut decoder = match self.audio_config {
+            Some(cfg) => Decoder::open_av(path, cfg)?,
+            None => Decoder::open(path)?,
+        };
         let info = decoder.info();
         self.frame_period = 1.0 / info.frame_rate.max(1e-3);
         self.transport = Transport::new();
@@ -105,6 +172,10 @@ impl Layer {
 
         self.info = Some(info);
         self.decoder = Some(decoder);
+
+        // Pump any audio that was demuxed alongside the first video
+        // frame into the ring buffer so playback starts in sync.
+        self.flush_audio_to_ring();
         Ok(())
     }
 
@@ -114,6 +185,19 @@ impl Layer {
         self.active_col = None;
         self.transport.playing = false;
         self.catchup = 0.0;
+        // Stale audio in the ring buffer would briefly play after the
+        // next clip is loaded; we accept up to ~340 ms of glitching
+        // here for V1 (ringbuf 0.4 producer has no clear-from-this-side
+        // primitive).
+    }
+
+    /// Set the mute flag on both the video side (skips draws) and the
+    /// audio side (the cpal callback skips this layer's samples).
+    pub fn set_mute(&mut self, muted: bool) {
+        self.mute = muted;
+        if let Some(a) = self.audio.as_ref() {
+            a.control.set_muted(muted);
+        }
     }
 
     pub fn restart(&mut self) {
@@ -128,19 +212,33 @@ impl Layer {
     }
 
     /// Pump the decoder for `dt` seconds of wall-clock time. Uploads the
-    /// freshest decoded frame to the layer's `VideoTexture`. Drops the
-    /// catch-up to zero on loop / EOF.
+    /// freshest decoded frame to the layer's `VideoTexture` and drains
+    /// any decoded audio into the ring buffer. Drops the catch-up to
+    /// zero on loop / EOF.
     pub fn tick(&mut self, gpu: &GpuContext, dt: f64) {
-        let Some(decoder) = self.decoder.as_mut() else {
+        if self.decoder.is_none() {
             return;
-        };
+        }
         if !self.transport.playing {
+            // Even when paused on a video boundary we drain decoded
+            // audio that was buffered, so the sample queue doesn't
+            // grow indefinitely.
+            self.flush_audio_to_ring();
             return;
         }
         let period = self.frame_period / self.transport.speed.max(1e-3);
         self.catchup += dt;
-        while self.catchup >= period {
+        loop {
+            // Always drain audio first; the video pump below may also
+            // demux fresh audio packets, which we'll drain on the next
+            // iteration.
+            self.flush_audio_to_ring();
+
+            if self.catchup < period {
+                break;
+            }
             self.catchup -= period;
+            let decoder = self.decoder.as_mut().expect("checked above");
             match decoder.next_frame() {
                 Ok(Some(frame)) => {
                     self.transport.position = frame.pts;
@@ -166,6 +264,39 @@ impl Layer {
                     break;
                 }
             }
+        }
+        // One last drain so any audio demuxed alongside the most
+        // recent video frame goes into the ring buffer this tick.
+        self.flush_audio_to_ring();
+    }
+
+    /// Move whatever audio the decoder has buffered into the ring
+    /// buffer. We aim to keep the ring buffer at least
+    /// `AUDIO_PUMP_TARGET_FILL` of its capacity. Anything beyond what
+    /// the buffer can hold stays inside the decoder's internal queue
+    /// and is drained on the next tick.
+    fn flush_audio_to_ring(&mut self) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        let Some(decoder) = self.decoder.as_mut() else {
+            return;
+        };
+        if decoder.audio_config().is_none() {
+            return;
+        }
+        let _target = (audio.producer.capacity().get() as f32 * AUDIO_PUMP_TARGET_FILL) as usize;
+        let free = audio.free_samples();
+        if free == 0 {
+            return;
+        }
+        if self.audio_scratch.len() < free {
+            self.audio_scratch.resize(free, 0.0);
+        }
+        let scratch = &mut self.audio_scratch[..free];
+        let n = decoder.take_audio_into(scratch);
+        if n > 0 {
+            audio.push(&scratch[..n]);
         }
     }
 

@@ -1,5 +1,7 @@
 use avengine_compositor::{CompositionTarget, GpuContext, VideoPipelines};
+use avengine_playback::AudioConfig;
 
+use crate::audio::AudioLayerHandle;
 use crate::layer::Layer;
 
 /// Owns the offscreen render target and the stack of layers that draw
@@ -11,8 +13,21 @@ pub struct Composition {
 }
 
 impl Composition {
-    pub fn new(gpu: &GpuContext, layer_count: usize, width: u32, height: u32) -> Self {
-        let layers = (0..layer_count.max(1)).map(|_| Layer::new(gpu)).collect();
+    /// Build a composition. One `AudioLayerHandle` per layer is consumed
+    /// — the producer ends end up inside the `Layer`s, the matching
+    /// consumer ends are already wired into the audio engine's cpal
+    /// stream by the caller.
+    pub fn new(
+        gpu: &GpuContext,
+        audio_handles: Vec<AudioLayerHandle>,
+        audio_config: AudioConfig,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let layers = audio_handles
+            .into_iter()
+            .map(|h| Layer::new(gpu, h, audio_config))
+            .collect();
         let target = CompositionTarget::new(&gpu.device, width, height);
         Self { layers, target }
     }

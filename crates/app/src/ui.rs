@@ -21,6 +21,8 @@ pub struct LayerView<'a> {
     pub info: Option<StreamInfo>,
     /// Display name for the active clip, if any.
     pub active_name: Option<&'a str>,
+    /// Per-layer audio gain (1.0 = unity).
+    pub audio_gain: f32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -61,6 +63,12 @@ pub struct UiActions {
     pub set_clip_default_loop: Option<((usize, usize), bool)>,
     pub set_clip_default_speed: Option<((usize, usize), f64)>,
     pub set_clip_default_blend: Option<((usize, usize), BlendMode)>,
+    /// Master audio volume (0.0..=2.0).
+    pub set_master_volume: Option<f32>,
+    /// Per-layer audio gain (0.0..=2.0).
+    pub set_layer_audio_gain: Option<(usize, f32)>,
+    /// Switch the active output audio device to the named one.
+    pub set_audio_device: Option<String>,
 }
 
 pub struct UiContext<'a> {
@@ -77,6 +85,9 @@ pub struct UiContext<'a> {
     pub monitors: &'a [MonitorHandle],
     pub selected_monitor: usize,
     pub output_fullscreen: bool,
+    pub audio_devices: &'a [String],
+    pub current_audio_device: Option<&'a str>,
+    pub master_volume: f32,
 }
 
 pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
@@ -183,6 +194,49 @@ fn left_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     ui.add_space(6.0);
 
     output_settings_section(ui, ctx, actions);
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    audio_settings_section(ui, ctx, actions);
+}
+
+fn audio_settings_section(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    ui.heading("Audio");
+    ui.add_space(4.0);
+
+    let current = ctx.current_audio_device.unwrap_or("(no device)").to_owned();
+    let mut new_selected: Option<String> = None;
+    egui::ComboBox::from_label("Output")
+        .selected_text(current)
+        .width((ui.available_width() - 70.0).max(160.0))
+        .show_ui(ui, |ui| {
+            if ctx.audio_devices.is_empty() {
+                ui.label(egui::RichText::new("(no devices)").weak());
+            }
+            for name in ctx.audio_devices {
+                let is_current = ctx.current_audio_device == Some(name.as_str());
+                if ui.selectable_label(is_current, name).clicked() && !is_current {
+                    new_selected = Some(name.clone());
+                }
+            }
+        });
+    if let Some(name) = new_selected {
+        actions.set_audio_device = Some(name);
+    }
+
+    let mut master = ctx.master_volume;
+    if ui
+        .add(
+            egui::Slider::new(&mut master, 0.0..=2.0)
+                .text("Master")
+                .fixed_decimals(2),
+        )
+        .changed()
+    {
+        actions.set_master_volume = Some(master);
+    }
 }
 
 fn output_settings_section(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
@@ -360,6 +414,28 @@ fn right_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) 
     if let Some(info) = layer.info {
         ui.label(format!("{:>6.2}s / {:>6.2}s", layer.position, info.duration));
     }
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    ui.heading("Audio");
+    let mut gain = layer.audio_gain;
+    if ui
+        .add(
+            egui::Slider::new(&mut gain, 0.0..=2.0)
+                .text("Gain")
+                .fixed_decimals(2),
+        )
+        .changed()
+    {
+        actions.set_layer_audio_gain = Some((layer.index, gain));
+    }
+    ui.label(
+        egui::RichText::new("Mute (above) silences both video and audio for this layer.")
+            .small()
+            .weak(),
+    );
 }
 
 const CELL_FOOTER_H: f32 = 20.0;

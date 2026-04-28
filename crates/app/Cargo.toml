@@ -27,5 +27,7 @@ pollster.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rfd.workspace = true
+cpal.workspace = true
+ringbuf.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

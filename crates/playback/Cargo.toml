@@ -11,3 +11,5 @@ workspace = true
 avengine-core.workspace = true
 ffmpeg-next.workspace = true
 tracing.workspace = true
+ringbuf.workspace = true
+bytemuck.workspace = true

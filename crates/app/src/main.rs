@@ -1,3 +1,4 @@
+mod audio;
 mod composition;
 mod layer;
 mod library;
@@ -63,6 +64,12 @@ struct Cli {
     #[arg(long, value_name = "N")]
     output_monitor: Option<usize>,
 
+    /// Name of the audio output device (cpal device description). If
+    /// unset, the host default is used. Use `--list-audio-devices` to
+    /// see what's available.
+    #[arg(long, value_name = "NAME")]
+    audio_device: Option<String>,
+
     /// Start the output window in borderless fullscreen on its monitor.
     #[arg(long, short)]
     fullscreen: bool,
@@ -70,6 +77,10 @@ struct Cli {
     /// List available monitors and exit.
     #[arg(long)]
     list_monitors: bool,
+
+    /// List available audio output devices and exit.
+    #[arg(long)]
+    list_audio_devices: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +130,11 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        if self.cli.list_audio_devices {
+            print_audio_devices();
+            event_loop.exit();
+            return;
+        }
         match AppState::new(event_loop, &self.cli) {
             Ok(state) => self.state = Some(state),
             Err(e) => {
@@ -144,6 +160,25 @@ impl ApplicationHandler for App {
             && let Err(e) = state.tick() {
                 error!("tick error: {e:#}");
             }
+    }
+}
+
+fn print_audio_devices() {
+    let (engine, _handles) = audio::AudioEngine::new(0);
+    let devices = engine.list_device_names();
+    let default = engine.default_device_name();
+    if devices.is_empty() {
+        println!("No audio output devices detected.");
+        return;
+    }
+    println!("Available audio output devices:");
+    for name in &devices {
+        let star = if Some(name.as_str()) == default.as_deref() {
+            " *default*"
+        } else {
+            ""
+        };
+        println!("  {name}{star}");
     }
 }
 
@@ -209,6 +244,9 @@ struct AppState {
     /// re-registered when the target's generation bumps).
     composition_egui_id: Option<egui::TextureId>,
     bound_composition_gen: u64,
+
+    /// Audio output engine. Holds the cpal stream + per-layer mixer.
+    audio_engine: audio::AudioEngine,
 }
 
 struct ControlWindow {
@@ -296,10 +334,26 @@ impl AppState {
         let surface_pipelines = VideoPipelines::new(&gpu.device, control_surface.format());
 
         let SizeArg(comp_w, comp_h) = cli.composition_size;
-        let composition = Composition::new(&gpu, cli.layers, comp_w, comp_h);
+
+        // Audio engine: allocates one ring buffer per layer up front, hands
+        // back the producer-side handles, and starts the cpal stream on
+        // either the requested device or the host default. We launch it
+        // before composing so each Layer can be wired with its audio
+        // handle at construction time.
+        let (mut audio_engine, audio_handles) = audio::AudioEngine::new(cli.layers);
+        if let Err(e) = audio_engine.start(cli.audio_device.as_deref()) {
+            warn!("audio engine failed to start: {e:#}; continuing silently");
+        }
+        let audio_config = audio_engine.audio_config();
+
+        let composition = Composition::new(&gpu, audio_handles, audio_config, comp_w, comp_h);
         info!(
-            "composition: {}x{}, {} layer(s) × {} column(s)",
-            comp_w, comp_h, cli.layers, cli.columns,
+            "composition: {}x{}, {} layer(s) × {} column(s); audio device: {:?}",
+            comp_w,
+            comp_h,
+            cli.layers,
+            cli.columns,
+            audio_engine.current_device_name(),
         );
 
         let egui_ctx = egui::Context::default();
@@ -334,7 +388,8 @@ impl AppState {
 
         let library = Library::new(cli.layers, cli.columns);
 
-        let preview = Layer::new(&gpu);
+        // Preview deck has no audio output — it only feeds the Cue pane.
+        let preview = Layer::new_silent(&gpu);
 
         let mut state = Self {
             gpu,
@@ -356,6 +411,7 @@ impl AppState {
             last_tick: Instant::now(),
             composition_egui_id: None,
             bound_composition_gen: u64::MAX,
+            audio_engine,
         };
 
         // Preload CLI clips into row 0 left-to-right, activating the first
@@ -775,6 +831,7 @@ impl AppState {
                 active_name: l
                     .active_col
                     .and_then(|c| self.library.cell(idx, c).map(|s| s.name.as_str())),
+                audio_gain: l.audio_gain(),
             })
             .collect();
         let composition_playing = self.composition.any_playing();
@@ -800,6 +857,7 @@ impl AppState {
             let (w, h) = self.composition.target.size;
             if h == 0 { 16.0 / 9.0 } else { w as f32 / h as f32 }
         };
+        let audio_devices = self.audio_engine.list_device_names();
         let ui_ctx = UiContext {
             library: &self.library,
             layers: &layer_views,
@@ -815,6 +873,9 @@ impl AppState {
             monitors: &self.monitors,
             selected_monitor: self.output.selected_monitor,
             output_fullscreen: self.output.surface.window().fullscreen().is_some(),
+            audio_devices: &audio_devices,
+            current_audio_device: self.audio_engine.current_device_name(),
+            master_volume: self.audio_engine.master_volume(),
         };
         let actions = ui::draw_control(&self.control.egui_ctx, ui_ctx);
 
@@ -928,8 +989,25 @@ impl AppState {
         }
         if let Some((i, mute)) = actions.set_layer_mute
             && let Some(l) = self.composition.layers.get_mut(i) {
-                l.mute = mute;
+                l.set_mute(mute);
             }
+        if let Some((i, gain)) = actions.set_layer_audio_gain
+            && let Some(l) = self.composition.layers.get(i) {
+                l.set_audio_gain(gain);
+            }
+        if let Some(v) = actions.set_master_volume {
+            self.audio_engine.set_master_volume(v);
+        }
+        if let Some(name) = actions.set_audio_device {
+            if let Err(e) = self
+                .audio_engine
+                .switch_device(&mut self.composition.layers, Some(&name))
+            {
+                error!("audio device switch to {name:?} failed: {e:#}");
+            } else {
+                info!("audio device → {name:?}");
+            }
+        }
         if let Some((i, blend)) = actions.set_layer_blend
             && let Some(l) = self.composition.layers.get_mut(i) {
                 l.blend_mode = blend;
