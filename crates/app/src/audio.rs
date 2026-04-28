@@ -25,6 +25,10 @@ const LAYER_BUFFER_CAPACITY: usize = 32_768;
 /// thread can read it lock-free.
 pub struct AudioLayerControl {
     pub gain_bits: AtomicU32,
+    /// Layer master fade (0.0..=1.0), folded into the audio path the
+    /// same way it folds into the visual path. Drag the master to 0
+    /// and both buses go silent / black at once.
+    pub master_bits: AtomicU32,
     pub muted: AtomicBool,
 }
 
@@ -32,6 +36,7 @@ impl Default for AudioLayerControl {
     fn default() -> Self {
         Self {
             gain_bits: AtomicU32::new(1.0_f32.to_bits()),
+            master_bits: AtomicU32::new(1.0_f32.to_bits()),
             muted: AtomicBool::new(false),
         }
     }
@@ -44,6 +49,14 @@ impl AudioLayerControl {
 
     pub fn gain(&self) -> f32 {
         f32::from_bits(self.gain_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn set_master(&self, master: f32) {
+        self.master_bits.store(master.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn master(&self) -> f32 {
+        f32::from_bits(self.master_bits.load(Ordering::Relaxed))
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -307,15 +320,15 @@ fn mix(
             let _ = src.consumer.pop_slice(scratch);
             continue;
         }
-        let gain = src.control.gain();
-        if gain == 0.0 {
+        let effective_gain = src.control.gain() * src.control.master();
+        if effective_gain == 0.0 {
             let _ = src.consumer.pop_slice(scratch);
             continue;
         }
         let take = output.len().min(scratch.len());
         let popped = src.consumer.pop_slice(&mut scratch[..take]);
         for i in 0..popped {
-            output[i] += scratch[i] * gain;
+            output[i] += scratch[i] * effective_gain;
         }
     }
     let master_g = f32::from_bits(master.load(Ordering::Relaxed));

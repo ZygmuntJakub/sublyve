@@ -22,6 +22,11 @@ const AUDIO_PUMP_TARGET_FILL: f32 = 0.5;
 pub struct Layer {
     pub blend_mode: BlendMode,
     pub opacity: f32,
+    /// Layer "master" multiplier (0.0..=1.0) applied on top of both the
+    /// per-layer `opacity` (visual) and `audio_gain` (audio) — the
+    /// equivalent of a DJ channel fader. `1.0` is "fully present", `0.0`
+    /// is "completely faded out". Drives the live quick-controls strip.
+    pub master: f32,
     pub mute: bool,
 
     /// Column of the currently-loaded clip (or `None` if the layer is empty).
@@ -81,6 +86,7 @@ impl Layer {
         Self {
             blend_mode: BlendMode::Normal,
             opacity: 1.0,
+            master: 1.0,
             mute: false,
             active_col: None,
             transport: Transport::new(),
@@ -95,6 +101,16 @@ impl Layer {
             audio,
             audio_config,
             audio_scratch: Vec::new(),
+        }
+    }
+
+    /// Update the layer master and propagate to the audio control so
+    /// the cpal callback applies the same multiplier on the audio side.
+    pub fn set_master(&mut self, master: f32) {
+        let m = master.clamp(0.0, 1.0);
+        self.master = m;
+        if let Some(a) = self.audio.as_ref() {
+            a.control.set_master(m);
         }
     }
 
@@ -128,7 +144,7 @@ impl Layer {
     }
 
     pub fn is_visible(&self) -> bool {
-        !self.mute && !self.is_empty() && self.opacity > 0.001
+        !self.mute && !self.is_empty() && self.opacity * self.master > 0.001
     }
 
     /// Load a clip into this layer. Replaces any existing decoder.
@@ -316,10 +332,15 @@ impl Layer {
             composition_size.0,
             composition_size.1,
         );
+        // Effective opacity folds the layer master in — drag the master
+        // to 0 and the layer fades out regardless of its own opacity
+        // setting; the audio side applies the same multiplier in the
+        // cpal mix loop.
+        let effective_opacity = self.opacity * self.master;
         gpu.queue.write_buffer(
             &self.uniforms_buffer,
             0,
-            bytemuck::bytes_of(&Uniforms::new(scale, self.opacity)),
+            bytemuck::bytes_of(&Uniforms::new(scale, effective_opacity)),
         );
 
         if self.bound_video_gen != self.video_texture.generation() || self.bind_group.is_none() {

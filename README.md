@@ -76,14 +76,27 @@ Triggering a clip auto-selects its layer in the right-hand inspector.
 | Esc   | output  | leave fullscreen                                                 |
 | Esc   | control | clear cue (or quit if nothing cued)                              |
 
+## Quick controls
+
+Each layer's row in the grid has a Resolume-style quick-controls strip on the left, between the row label and the cell columns:
+
+- **`✕`** — clear the layer (drops its decoder; kills audio + video at once).
+- **Vol** — vertical fader for the layer's audio gain (0.0–2.0).
+- **Opa** — vertical fader for the layer's video opacity (0.0–1.0).
+- **Mst** — **master fade** (0.0–1.0). Multiplies into both the visual opacity uniform *and* the audio mix gain at the same time, like a DJ channel fader. Drag to 0 → the whole layer fades to black and silent simultaneously, regardless of its individual opacity / volume settings.
+
+The right-panel layer inspector still has the same controls with numeric labels for fine adjustment; both UIs bind to the same atomics, so changes are visible in both places live.
+
+**Right-click any slider** (quick strip, layer inspector, master volume, per-clip default speed) to snap it back to its default (`1.0` everywhere).
+
 ## Save / Load project
 
-`💾 Save…` and `📂 Open…` in the top transport bar persist the workspace as a JSON project file (`.sublyve.json`). The format is human-readable and version-stamped (`{ "version": 1, "project": { … } }`); the loader rejects newer versions with a clear error rather than misinterpreting fields.
+`💾 Save…` and `📂 Open…` in the top transport bar persist the workspace as a JSON project file (`.sublyve.json`). The format is human-readable and version-stamped (`{ "version": 2, "project": { … } }`); the loader rejects newer versions with a clear error rather than misinterpreting fields. Older versions still load — `version: 1` files (no `master` field on layers) come in with master defaulting to 1.0.
 
 What's saved:
 
 - **Library cells**: every occupied `(row, col)` with its absolute path and per-clip defaults (loop / speed / blend).
-- **Per-layer compositing**: `blend_mode`, `opacity`, `mute`, `audio_gain` for every layer.
+- **Per-layer compositing**: `blend_mode`, `opacity`, `mute`, `audio_gain`, and `master` (added in schema v2) for every layer.
 - **Composition**: target width × height. Loading resizes the offscreen target if it differs.
 - **Output**: monitor index (best-effort by index across reboots), fullscreen flag.
 - **Audio**: device name, master volume.

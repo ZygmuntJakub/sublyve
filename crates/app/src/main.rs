@@ -875,6 +875,7 @@ impl AppState {
                 index: idx,
                 blend_mode: l.blend_mode,
                 opacity: l.opacity,
+                master: l.master,
                 mute: l.mute,
                 playing: l.transport.playing,
                 looping: l.transport.looping,
@@ -1048,6 +1049,14 @@ impl AppState {
         if let Some((i, gain)) = actions.set_layer_audio_gain
             && let Some(l) = self.composition.layers.get(i) {
                 l.set_audio_gain(gain);
+            }
+        if let Some((i, master)) = actions.set_layer_master
+            && let Some(l) = self.composition.layers.get_mut(i) {
+                l.set_master(master);
+            }
+        if let Some(idx) = actions.clear_layer
+            && let Some(l) = self.composition.layers.get_mut(idx) {
+                l.clear();
             }
         if let Some(v) = actions.set_master_volume {
             self.audio_engine.set_master_volume(v);
@@ -1283,6 +1292,7 @@ impl AppState {
             layer.opacity = spec.opacity;
             layer.set_mute(spec.mute);
             layer.set_audio_gain(spec.audio_gain);
+            layer.set_master(spec.master);
         }
 
         // Library: import every saved cell. Each call decodes a
@@ -1341,6 +1351,7 @@ impl AppState {
                 opacity: l.opacity,
                 mute: l.mute,
                 audio_gain: l.audio_gain(),
+                master: l.master,
             })
             .collect();
         project::Project {

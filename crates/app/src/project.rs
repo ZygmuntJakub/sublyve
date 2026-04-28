@@ -11,7 +11,11 @@ use crate::library::ClipDefaults;
 /// breaking change to the on-disk shape; the loader rejects newer
 /// versions with a clear error rather than silently misinterpreting
 /// fields.
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// History:
+/// - `1`: initial schema (multi-layer grid + audio + output settings).
+/// - `2`: adds `master` to `LayerSpec` (defaults to 1.0 for v1 files).
+pub const CURRENT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectFile {
@@ -56,6 +60,14 @@ pub struct LayerSpec {
     pub opacity: f32,
     pub mute: bool,
     pub audio_gain: f32,
+    /// Layer master fade (added in schema v2). Defaults to 1.0 when
+    /// the JSON omits it — keeps v1 files loading cleanly.
+    #[serde(default = "default_master")]
+    pub master: f32,
+}
+
+fn default_master() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +179,7 @@ mod tests {
                     opacity: 1.0,
                     mute: false,
                     audio_gain: 1.0,
+                    master: 1.0,
                 },
                 LayerSpec {
                     index: 1,
@@ -174,6 +187,7 @@ mod tests {
                     opacity: 0.6,
                     mute: false,
                     audio_gain: 0.3,
+                    master: 0.75,
                 },
             ],
             output: OutputSpec {
@@ -215,6 +229,37 @@ mod tests {
         let err = load_from_path(&path).expect_err("should reject");
         let msg = format!("{err}");
         assert!(msg.contains("999"), "error mentions the unsupported version: {msg}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v1_files_load_with_master_defaulting_to_1() {
+        // A `version: 1` JSON has no `master` field on each layer.
+        // The `serde(default = …)` attribute fills it in as 1.0.
+        let json = r#"{
+            "version": 1,
+            "project": {
+                "composition": {"width": 1280, "height": 720},
+                "library": {"layers": 2, "columns": 4, "cells": []},
+                "layers": [
+                    {"index": 0, "blend": "Normal", "opacity": 0.8, "mute": false, "audio_gain": 1.5},
+                    {"index": 1, "blend": "Add", "opacity": 0.5, "mute": true, "audio_gain": 0.0}
+                ],
+                "output": {"monitor_index": 0, "fullscreen": false},
+                "audio": {"device_name": null, "master_volume": 1.0}
+            }
+        }"#;
+        let dir = tempdir_path();
+        let path = dir.join("v1.sublyve.json");
+        std::fs::write(&path, json).expect("write tmp");
+        let loaded = load_from_path(&path).expect("load v1");
+        assert_eq!(loaded.layers.len(), 2);
+        for spec in &loaded.layers {
+            assert_eq!(spec.master, 1.0, "v1 layer must default master to 1.0");
+        }
+        // Other fields still come through correctly.
+        assert_eq!(loaded.layers[0].opacity, 0.8);
+        assert_eq!(loaded.layers[1].audio_gain, 0.0);
         let _ = std::fs::remove_file(&path);
     }
 

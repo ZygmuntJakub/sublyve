@@ -10,6 +10,9 @@ pub struct LayerView<'a> {
     pub index: usize,
     pub blend_mode: BlendMode,
     pub opacity: f32,
+    /// Layer master fade (0.0..=1.0); applied on top of opacity + audio
+    /// gain. Drag to 0 to fade the whole layer out at once.
+    pub master: f32,
     pub mute: bool,
     pub playing: bool,
     pub looping: bool,
@@ -73,6 +76,13 @@ pub struct UiActions {
     pub save_project: bool,
     /// `📂 Open…` button — prompt for a path and load a project.
     pub open_project: bool,
+    /// X button on the per-row quick-controls strip — clear the
+    /// layer's active clip (drops decoder, kills audio + video).
+    pub clear_layer: Option<usize>,
+    /// Per-layer master fade slider (0.0..=1.0) on the quick-controls
+    /// strip. Multiplies into both the visual opacity uniform and the
+    /// audio mix gain.
+    pub set_layer_master: Option<(usize, f32)>,
 }
 
 pub struct UiContext<'a> {
@@ -128,6 +138,36 @@ pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
         .show(ctx, |ui| grid_panel(ui, &ui_ctx, &mut actions));
 
     actions
+}
+
+/// Slider convention: right-click resets to a sensible default. Given
+/// the slider's response and a `&mut value`, returns the value to
+/// commit if anything changed (drag *or* right-click reset), or
+/// `None` if the slider was untouched.
+///
+/// `egui::Slider` allocates its `Response` with `Sense::click_and_drag()`
+/// which only tracks the *primary* mouse button — `resp.secondary_clicked()`
+/// always returns `false` on a slider. We instead read the secondary
+/// click directly from the input layer and gate it on `resp.hovered()`,
+/// which gives us the "right-click on this slider" semantic. Reset
+/// happens *after* the slider's own drag logic has already moved the
+/// value, so we overwrite that to the default.
+fn slider_value_after<F: Copy>(
+    resp: egui::Response,
+    value: &mut F,
+    default: F,
+) -> Option<F> {
+    let right_clicked_on_slider = resp.hovered()
+        && resp.ctx.input(|i| i.pointer.secondary_clicked());
+    if right_clicked_on_slider {
+        *value = default;
+        return Some(default);
+    }
+    if resp.changed() {
+        Some(*value)
+    } else {
+        None
+    }
 }
 
 fn panel_frame(alpha: u8) -> egui::Frame {
@@ -238,15 +278,13 @@ fn audio_settings_section(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut 
     }
 
     let mut master = ctx.master_volume;
-    if ui
-        .add(
-            egui::Slider::new(&mut master, 0.0..=2.0)
-                .text("Master")
-                .fixed_decimals(2),
-        )
-        .changed()
-    {
-        actions.set_master_volume = Some(master);
+    let resp = ui.add(
+        egui::Slider::new(&mut master, 0.0..=2.0)
+            .text("Master")
+            .fixed_decimals(2),
+    );
+    if let Some(v) = slider_value_after(resp, &mut master, 1.0) {
+        actions.set_master_volume = Some(v);
     }
 }
 
@@ -367,15 +405,13 @@ fn right_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) 
     }
 
     let mut opacity = layer.opacity;
-    if ui
-        .add(
-            egui::Slider::new(&mut opacity, 0.0..=1.0)
-                .text("Opacity")
-                .fixed_decimals(2),
-        )
-        .changed()
-    {
-        actions.set_layer_opacity = Some((layer.index, opacity));
+    let resp = ui.add(
+        egui::Slider::new(&mut opacity, 0.0..=1.0)
+            .text("Opacity")
+            .fixed_decimals(2),
+    );
+    if let Some(v) = slider_value_after(resp, &mut opacity, 1.0) {
+        actions.set_layer_opacity = Some((layer.index, v));
     }
 
     ui.add_space(10.0);
@@ -409,16 +445,14 @@ fn right_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) 
     }
 
     let mut speed = layer.speed;
-    if ui
-        .add_enabled(
-            has_clip,
-            egui::Slider::new(&mut speed, 0.1..=4.0)
-                .text("Speed")
-                .logarithmic(true),
-        )
-        .changed()
-    {
-        actions.set_layer_speed = Some((layer.index, speed));
+    let resp = ui.add_enabled(
+        has_clip,
+        egui::Slider::new(&mut speed, 0.1..=4.0)
+            .text("Speed")
+            .logarithmic(true),
+    );
+    if let Some(v) = slider_value_after(resp, &mut speed, 1.0) {
+        actions.set_layer_speed = Some((layer.index, v));
     }
 
     ui.add_space(8.0);
@@ -432,20 +466,42 @@ fn right_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) 
 
     ui.heading("Audio");
     let mut gain = layer.audio_gain;
-    if ui
-        .add(
-            egui::Slider::new(&mut gain, 0.0..=2.0)
-                .text("Gain")
-                .fixed_decimals(2),
-        )
-        .changed()
-    {
-        actions.set_layer_audio_gain = Some((layer.index, gain));
+    let resp = ui.add(
+        egui::Slider::new(&mut gain, 0.0..=2.0)
+            .text("Gain")
+            .fixed_decimals(2),
+    );
+    if let Some(v) = slider_value_after(resp, &mut gain, 1.0) {
+        actions.set_layer_audio_gain = Some((layer.index, v));
     }
     ui.label(
         egui::RichText::new("Mute (above) silences both video and audio for this layer.")
             .small()
             .weak(),
+    );
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    ui.heading("Master");
+    let mut master = layer.master;
+    let resp = ui.add(
+        egui::Slider::new(&mut master, 0.0..=1.0)
+            .text("Master")
+            .fixed_decimals(2),
+    );
+    if let Some(v) = slider_value_after(resp, &mut master, 1.0) {
+        actions.set_layer_master = Some((layer.index, v));
+    }
+    ui.label(
+        egui::RichText::new(
+            "Master fades both video opacity and audio gain at once \
+             — same control as the rightmost slider in the row's quick \
+             strip. Right-click any slider to reset.",
+        )
+        .small()
+        .weak(),
     );
 }
 
@@ -453,6 +509,11 @@ const CELL_FOOTER_H: f32 = 20.0;
 const CELL_GAP: f32 = 4.0;
 const ROW_LABEL_W: f32 = 28.0;
 const MIN_CELL_W: f32 = 96.0;
+/// Total width of the per-row quick-controls strip (X button + 3
+/// vertical sliders + their labels). Tuned to host three vertical
+/// sliders side-by-side without crowding.
+const QUICK_STRIP_W: f32 = 132.0;
+const QUICK_SLIDER_W: f32 = 32.0;
 
 fn clip_inspector(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     match ctx.cued {
@@ -561,15 +622,13 @@ fn clip_metadata_inspector(
 
             // Default speed.
             let mut speed = slot.defaults.speed;
-            if ui
-                .add(
-                    egui::Slider::new(&mut speed, 0.1..=4.0)
-                        .text("Speed")
-                        .logarithmic(true),
-                )
-                .changed()
-            {
-                actions.set_clip_default_speed = Some(((row, col), speed));
+            let resp = ui.add(
+                egui::Slider::new(&mut speed, 0.1..=4.0)
+                    .text("Speed")
+                    .logarithmic(true),
+            );
+            if let Some(v) = slider_value_after(resp, &mut speed, 1.0) {
+                actions.set_clip_default_speed = Some(((row, col), v));
             }
 
             // Default blend.
@@ -599,7 +658,10 @@ fn grid_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let avail = ui.available_width() - ROW_LABEL_W - (cols as f32 + 1.0) * CELL_GAP;
+            let avail = ui.available_width()
+                - ROW_LABEL_W
+                - QUICK_STRIP_W
+                - (cols as f32 + 1.0) * CELL_GAP;
             let cell_w = (avail / cols as f32).max(MIN_CELL_W);
             // 16:9 thumbnail area + a small footer for the badges and name.
             let cell_h = cell_w * 9.0 / 16.0 + CELL_FOOTER_H;
@@ -611,6 +673,7 @@ fn grid_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = CELL_GAP;
                     row_label(ui, ctx, actions, row, cell_h);
+                    quick_controls_strip(ui, ctx, actions, row, cell_h);
                     for col in 0..cols {
                         cell_widget(ui, ctx, actions, row, col, cell_w, cell_h);
                     }
@@ -618,6 +681,115 @@ fn grid_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
                 ui.add_space(CELL_GAP);
             }
         });
+}
+
+/// Per-row Resolume-style quick controls: an `X` clear button and
+/// three vertical faders for **V**olume, **O**pacity, and **M**aster.
+/// All three are live: drag-down on Master fades both audio and video
+/// at once. The right-panel inspector keeps the same controls with
+/// numeric labels for fine adjustment; the strip is for live use.
+fn quick_controls_strip(
+    ui: &mut egui::Ui,
+    ctx: &UiContext<'_>,
+    actions: &mut UiActions,
+    row: usize,
+    height: f32,
+) {
+    let layer = ctx.layers.get(row).copied();
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(QUICK_STRIP_W, height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            // Clear button: small red X, top-aligned to the strip.
+            let has_clip = layer.is_some_and(|l| l.active_col.is_some());
+            ui.vertical(|ui| {
+                ui.add_space(2.0);
+                let btn = egui::Button::new(
+                    egui::RichText::new("✕")
+                        .strong()
+                        .color(egui::Color32::from_rgb(220, 80, 80)),
+                )
+                .min_size(egui::vec2(20.0, 22.0));
+                if ui.add_enabled(has_clip, btn)
+                    .on_hover_text("Clear this layer (stops audio + video)")
+                    .clicked()
+                {
+                    actions.clear_layer = Some(row);
+                }
+            });
+
+            let Some(layer) = layer else { return };
+
+            // Three vertical sliders: V, O, M. Each takes the full
+            // strip height minus a small label footer. egui's
+            // `Slider::vertical()` does the orientation; `text("X")`
+            // would print on the side, so we render labels manually
+            // with `Painter` after the slider.
+            let slider_h = (height - 18.0).max(60.0);
+
+            // Volume.
+            let mut gain = layer.audio_gain;
+            ui.vertical(|ui| {
+                let resp = ui.add_sized(
+                    egui::vec2(QUICK_SLIDER_W, slider_h),
+                    egui::Slider::new(&mut gain, 0.0..=2.0)
+                        .vertical()
+                        .show_value(false),
+                );
+                if let Some(v) = slider_value_after(resp, &mut gain, 1.0) {
+                    actions.set_layer_audio_gain = Some((row, v));
+                }
+                ui.add_sized(
+                    egui::vec2(QUICK_SLIDER_W, 12.0),
+                    egui::Label::new(egui::RichText::new("Vol").small().weak())
+                        .selectable(false),
+                );
+            });
+
+            // Opacity.
+            let mut opacity = layer.opacity;
+            ui.vertical(|ui| {
+                let resp = ui.add_sized(
+                    egui::vec2(QUICK_SLIDER_W, slider_h),
+                    egui::Slider::new(&mut opacity, 0.0..=1.0)
+                        .vertical()
+                        .show_value(false),
+                );
+                if let Some(v) = slider_value_after(resp, &mut opacity, 1.0) {
+                    actions.set_layer_opacity = Some((row, v));
+                }
+                ui.add_sized(
+                    egui::vec2(QUICK_SLIDER_W, 12.0),
+                    egui::Label::new(egui::RichText::new("Opa").small().weak())
+                        .selectable(false),
+                );
+            });
+
+            // Master.
+            let mut master = layer.master;
+            ui.vertical(|ui| {
+                let resp = ui.add_sized(
+                    egui::vec2(QUICK_SLIDER_W, slider_h),
+                    egui::Slider::new(&mut master, 0.0..=1.0)
+                        .vertical()
+                        .show_value(false),
+                );
+                if let Some(v) = slider_value_after(resp, &mut master, 1.0) {
+                    actions.set_layer_master = Some((row, v));
+                }
+                ui.add_sized(
+                    egui::vec2(QUICK_SLIDER_W, 12.0),
+                    egui::Label::new(
+                        egui::RichText::new("Mst").small().strong(),
+                    )
+                    .selectable(false),
+                );
+            });
+        },
+    );
 }
 
 fn row_label(
