@@ -372,7 +372,8 @@ impl AppState {
         }
         if let Some(slot) = state.library.cell(0, 0) {
             let path = slot.path.clone();
-            if let Err(e) = state.composition.layers[0].load(&state.gpu, &path, 0) {
+            let defaults = slot.defaults;
+            if let Err(e) = state.composition.layers[0].load(&state.gpu, &path, 0, defaults) {
                 error!("failed to load layer 0: {e:#}");
             }
         }
@@ -523,17 +524,24 @@ impl AppState {
         Ok(())
     }
 
-    /// Park the clip at `(row, col)` in the Cue pane and start it
-    /// playing on the preview deck (off-output). Take (Enter / button)
-    /// sends it through to its real layer.
+    /// Park `(row, col)` in the cue. If the cell is filled the clip
+    /// starts playing on the preview deck; if it's empty the preview
+    /// deck is cleared and the bottom inspector switches to its
+    /// "browse for a file" mode. Either way the cue index is set —
+    /// the bottom panel uses it as its focus handle.
     fn cue(&mut self, row: usize, col: usize) {
-        let Some(slot) = self.library.cell(row, col) else {
+        if self.library.idx(row, col).is_none() {
             return;
-        };
-        let path = slot.path.clone();
+        }
         self.cued = Some((row, col));
-        if let Err(e) = self.preview.load(&self.gpu, &path, col) {
-            error!("preview load failed: {e:#}");
+        if let Some(slot) = self.library.cell(row, col) {
+            let path = slot.path.clone();
+            let defaults = slot.defaults;
+            if let Err(e) = self.preview.load(&self.gpu, &path, col, defaults) {
+                error!("preview load failed: {e:#}");
+                self.preview.clear();
+            }
+        } else {
             self.preview.clear();
         }
     }
@@ -554,7 +562,8 @@ impl AppState {
 
     /// Trigger the clip at `(row, col)` on its layer (loads + plays) and
     /// auto-select that layer in the inspector — chances are the user
-    /// wants to tweak the layer they just acted on.
+    /// wants to tweak the layer they just acted on. Per-clip defaults
+    /// are applied on entry.
     fn trigger(&mut self, row: usize, col: usize) {
         let Some(slot) = self.library.cell(row, col) else {
             return;
@@ -564,7 +573,8 @@ impl AppState {
             return;
         };
         let path = slot.path.clone();
-        if let Err(e) = layer.load(&self.gpu, &path, col) {
+        let defaults = slot.defaults;
+        if let Err(e) = layer.load(&self.gpu, &path, col, defaults) {
             error!("trigger load failed: {e:#}");
             return;
         }
@@ -960,6 +970,43 @@ impl AppState {
         }
         if actions.refresh_monitors {
             self.refresh_monitors();
+        }
+
+        if let Some((row, col)) = actions.browse_for_cell {
+            self.browse_into_cell(row, col);
+        }
+        if let Some(((r, c), looping)) = actions.set_clip_default_loop
+            && let Some(slot) = self.library.cell_mut(r, c)
+        {
+            slot.defaults.looping = looping;
+        }
+        if let Some(((r, c), speed)) = actions.set_clip_default_speed
+            && let Some(slot) = self.library.cell_mut(r, c)
+        {
+            slot.defaults.speed = speed;
+        }
+        if let Some(((r, c), blend)) = actions.set_clip_default_blend
+            && let Some(slot) = self.library.cell_mut(r, c)
+        {
+            slot.defaults.blend = blend;
+        }
+    }
+
+    /// Open a native file dialog and import the picked file into
+    /// `(row, col)`. Cue stays parked on the same cell, so the bottom
+    /// panel naturally switches from "empty / Browse" to "filled /
+    /// metadata + defaults" on the next render. Blocks the main loop
+    /// for the dialog's lifetime — acceptable since the user won't
+    /// browse mid-performance.
+    fn browse_into_cell(&mut self, row: usize, col: usize) {
+        let picked = rfd::FileDialog::new()
+            .set_title(format!("Choose a video for L{row} · C{col}"))
+            .add_filter("Video", &["mp4", "mov", "mkv", "webm", "avi", "m4v"])
+            .add_filter("All files", &["*"])
+            .pick_file();
+        let Some(path) = picked else { return };
+        if let Err(e) = self.import_clip(path, row, col) {
+            error!("import failed: {e:#}");
         }
     }
 }

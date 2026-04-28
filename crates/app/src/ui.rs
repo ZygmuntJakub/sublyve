@@ -54,6 +54,13 @@ pub struct UiActions {
     pub set_output_monitor: Option<usize>,
     pub set_output_fullscreen: Option<bool>,
     pub refresh_monitors: bool,
+    /// Browse… button on the bottom panel when the cue is parked on an
+    /// empty cell — opens a native file dialog and imports into (r, c).
+    pub browse_for_cell: Option<(usize, usize)>,
+    /// Per-clip default-setting edits from the bottom inspector.
+    pub set_clip_default_loop: Option<((usize, usize), bool)>,
+    pub set_clip_default_speed: Option<((usize, usize), f64)>,
+    pub set_clip_default_blend: Option<((usize, usize), BlendMode)>,
 }
 
 pub struct UiContext<'a> {
@@ -93,6 +100,13 @@ pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
         .min_width(220.0)
         .frame(panel_frame(255))
         .show(ctx, |ui| right_panel(ui, &ui_ctx, &mut actions));
+
+    egui::TopBottomPanel::bottom("avengine.clip_inspector")
+        .resizable(true)
+        .default_height(170.0)
+        .min_height(120.0)
+        .frame(panel_frame(255))
+        .show(ctx, |ui| clip_inspector(ui, &ui_ctx, &mut actions));
 
     egui::CentralPanel::default()
         .frame(panel_frame(255))
@@ -353,6 +367,141 @@ const CELL_GAP: f32 = 4.0;
 const ROW_LABEL_W: f32 = 28.0;
 const MIN_CELL_W: f32 = 96.0;
 
+fn clip_inspector(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    match ctx.cued {
+        None => clip_inspector_hint(ui),
+        Some((r, c)) => match ctx.library.cell(r, c) {
+            Some(slot) => clip_metadata_inspector(ui, ctx, actions, r, c, slot),
+            None => empty_slot_inspector(ui, actions, r, c),
+        },
+    }
+}
+
+fn clip_inspector_hint(ui: &mut egui::Ui) {
+    ui.heading("Clip");
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "Shift+click any cell in the grid to inspect that clip — \
+             empty cells let you browse for a file, filled cells show \
+             metadata and per-clip defaults.",
+        )
+        .weak(),
+    );
+}
+
+fn empty_slot_inspector(
+    ui: &mut egui::Ui,
+    actions: &mut UiActions,
+    row: usize,
+    col: usize,
+) {
+    ui.heading(format!("Empty slot · L{row} · C{col}"));
+    ui.add_space(8.0);
+
+    let btn = egui::Button::new(egui::RichText::new("📂  Browse…").strong().size(16.0))
+        .min_size(egui::vec2(180.0, 36.0));
+    if ui.add(btn).clicked() {
+        actions.browse_for_cell = Some((row, col));
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("…or drop a video file directly onto this cell.")
+            .small()
+            .weak(),
+    );
+}
+
+fn clip_metadata_inspector(
+    ui: &mut egui::Ui,
+    _ctx: &UiContext<'_>,
+    actions: &mut UiActions,
+    row: usize,
+    col: usize,
+    slot: &crate::library::ClipSlot,
+) {
+    ui.horizontal_top(|ui| {
+        // Left column: thumbnail (or placeholder if not yet decoded).
+        let thumb_w = 240.0;
+        let thumb_h = thumb_w * 9.0 / 16.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(thumb_w, thumb_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                if let Some(id) = slot.thumbnail_id {
+                    ui.image(egui::load::SizedTexture::new(id, egui::vec2(thumb_w, thumb_h)));
+                } else {
+                    thumb_placeholder(ui, thumb_w, 16.0 / 9.0, "no thumbnail");
+                }
+            },
+        );
+
+        ui.add_space(14.0);
+
+        // Right column: metadata + defaults editors.
+        ui.vertical(|ui| {
+            ui.heading(&slot.name);
+            ui.label(
+                egui::RichText::new(slot.path.display().to_string())
+                    .small()
+                    .weak(),
+            );
+            if let Some(thumb) = slot.thumbnail.as_ref() {
+                let (w, h) = thumb.size();
+                ui.label(
+                    egui::RichText::new(format!("source thumbnail {}×{}", w, h))
+                        .small()
+                        .weak(),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            ui.label(
+                egui::RichText::new("Defaults applied on every trigger")
+                    .small()
+                    .weak(),
+            );
+
+            // Default loop.
+            let mut looping = slot.defaults.looping;
+            if ui.checkbox(&mut looping, "Loop").changed() {
+                actions.set_clip_default_loop = Some(((row, col), looping));
+            }
+
+            // Default speed.
+            let mut speed = slot.defaults.speed;
+            if ui
+                .add(
+                    egui::Slider::new(&mut speed, 0.1..=4.0)
+                        .text("Speed")
+                        .logarithmic(true),
+                )
+                .changed()
+            {
+                actions.set_clip_default_speed = Some(((row, col), speed));
+            }
+
+            // Default blend.
+            let mut blend = slot.defaults.blend;
+            egui::ComboBox::from_label("Blend")
+                .selected_text(slot.defaults.blend.label())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for &m in BlendMode::ALL {
+                        ui.selectable_value(&mut blend, m, m.label());
+                    }
+                });
+            if blend != slot.defaults.blend {
+                actions.set_clip_default_blend = Some(((row, col), blend));
+            }
+        });
+    });
+}
+
 fn grid_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     let cols = ctx.library.columns();
     let rows = ctx.library.layers();
@@ -502,22 +651,24 @@ fn cell_widget(
     if response.hovered() {
         actions.hovered_cell = Some((row, col));
     }
-    if clip.is_some() {
-        // Plain click triggers immediately (the obvious path). Hold
-        // Shift to cue the clip into the Cue pane without sending it to
-        // output — for the deliberate B-bus workflow you want when
-        // pre-rolling something on a beat.
-        if response.clicked() || response.double_clicked() {
-            let shift = ui.input(|i| i.modifiers.shift);
-            if shift {
-                actions.cue_cell = Some((row, col));
-            } else {
-                actions.trigger_cell = Some((row, col));
-            }
+
+    // Click semantics:
+    //   - Plain click on a filled cell  → trigger immediately.
+    //   - Shift+click on any cell       → cue. On a filled cell this
+    //     parks the clip on the preview deck; on an empty cell it
+    //     parks the cue on the slot so the bottom inspector flips to
+    //     "Browse…" mode.
+    //   - Right-click on a filled cell  → stop the layer.
+    if response.clicked() || response.double_clicked() {
+        let shift = ui.input(|i| i.modifiers.shift);
+        if shift {
+            actions.cue_cell = Some((row, col));
+        } else if clip.is_some() {
+            actions.trigger_cell = Some((row, col));
         }
-        if response.secondary_clicked() {
-            actions.stop_layer_at = Some((row, col));
-        }
+    }
+    if clip.is_some() && response.secondary_clicked() {
+        actions.stop_layer_at = Some((row, col));
     }
 }
 

@@ -7,6 +7,8 @@ use avengine_playback::{Decoder, StreamInfo, Transport};
 use tracing::{error, warn};
 use wgpu::util::DeviceExt;
 
+use crate::library::ClipDefaults;
+
 /// One row of the grid: an independent decoder + transport that draws
 /// into the shared `CompositionTarget` with a chosen blend mode and
 /// opacity. Multiple `Layer`s play simultaneously and composite back-to-front.
@@ -68,15 +70,31 @@ impl Layer {
         !self.mute && !self.is_empty() && self.opacity > 0.001
     }
 
-    /// Load a clip into this layer. Replaces any existing decoder. The
-    /// first frame is decoded synchronously and uploaded to the layer's
-    /// `VideoTexture` so the next composition render isn't black.
-    pub fn load(&mut self, gpu: &GpuContext, path: &Path, col: usize) -> Result<()> {
+    /// Load a clip into this layer. Replaces any existing decoder.
+    ///
+    /// `defaults` are written into the transport (looping, speed) and the
+    /// layer's `blend_mode` on entry, so triggering a clip always yields
+    /// its declared default behaviour. The user can still override these
+    /// from the right-hand layer inspector mid-playback; the next trigger
+    /// will reset them again.
+    ///
+    /// The first frame is decoded synchronously and uploaded to the
+    /// layer's `VideoTexture` so the next composition render isn't black.
+    pub fn load(
+        &mut self,
+        gpu: &GpuContext,
+        path: &Path,
+        col: usize,
+        defaults: ClipDefaults,
+    ) -> Result<()> {
         let mut decoder = Decoder::open(path)?;
         let info = decoder.info();
         self.frame_period = 1.0 / info.frame_rate.max(1e-3);
         self.transport = Transport::new();
         self.transport.playing = true;
+        self.transport.looping = defaults.looping;
+        self.transport.speed = defaults.speed;
+        self.blend_mode = defaults.blend;
         self.catchup = 0.0;
         self.active_col = Some(col);
 

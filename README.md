@@ -43,8 +43,14 @@ Drag video files onto cells in the grid to add them to the library. `RUST_LOG=de
 
 Two windows:
 
-- **Control** (`avengine — control`) — top transport bar; central clip grid (rows = layers, cols = columns); left panel with the live **Output** preview, the **Cue** preview, the **TAKE** button, and Output settings (monitor + fullscreen); right panel with the **Layer settings** for whichever layer you've selected (click an `L0`/`L1`/… row label on the left of the grid).
+- **Control** (`avengine — control`) — top transport bar; central clip grid (rows = layers, cols = columns); left panel with the live **Output** preview, the **Cue** preview, the **TAKE** button, and Output settings (monitor + fullscreen); right panel with the **Layer settings** for whichever layer you've selected (click an `L0`/`L1`/… row label on the left of the grid); bottom panel with the **Clip inspector** for whichever cell is currently in the cue.
 - **Output** (`avengine — output`) — clean composition, no overlay. Drag onto a projector and press `F`.
+
+**Clip inspector (bottom panel).** The cue parks on a cell — filled or empty — and the bottom panel takes its cue from there:
+
+- **Empty cell cued** → shows a `Browse…` button that opens a native file dialog (`rfd`); the picked file imports into the cell, and the panel auto-switches to the metadata view on the next frame.
+- **Filled cell cued** → shows the clip's thumbnail, name, full path, source size, and per-clip default settings (loop / speed / blend). Defaults are applied every time the clip is triggered onto its layer; you can still override them mid-play from the right-hand layer inspector.
+- **No cue** → small hint.
 
 **Click semantics.**
 

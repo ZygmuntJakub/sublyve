@@ -1,9 +1,28 @@
 use std::path::PathBuf;
 
 use avengine_compositor::Thumbnail;
+use avengine_core::BlendMode;
 
-/// One clip slot in the grid: the file on disk, a display name, and an
-/// optional GPU thumbnail.
+/// Per-clip default settings, applied every time the clip is triggered
+/// onto a layer (`Layer::load` writes them into the layer's transport +
+/// blend mode). Live edits in the right-hand layer inspector still take
+/// precedence until the next trigger; the defaults are what the clip
+/// "wants" by default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipDefaults {
+    pub looping: bool,
+    pub speed: f64,
+    pub blend: BlendMode,
+}
+
+impl Default for ClipDefaults {
+    fn default() -> Self {
+        Self { looping: true, speed: 1.0, blend: BlendMode::Normal }
+    }
+}
+
+/// One clip slot in the grid: the file on disk, a display name, an
+/// optional GPU thumbnail, and per-clip default settings.
 ///
 /// The thumbnail is owned by the slot. The corresponding `egui::TextureId`
 /// (registered with `egui_wgpu::Renderer`) is tracked separately in the
@@ -14,6 +33,7 @@ pub struct ClipSlot {
     pub name: String,
     pub thumbnail: Option<Thumbnail>,
     pub thumbnail_id: Option<egui::TextureId>,
+    pub defaults: ClipDefaults,
 }
 
 impl ClipSlot {
@@ -23,7 +43,13 @@ impl ClipSlot {
             .and_then(|s| s.to_str())
             .map(str::to_owned)
             .unwrap_or_else(|| path.display().to_string());
-        Self { path, name, thumbnail: None, thumbnail_id: None }
+        Self {
+            path,
+            name,
+            thumbnail: None,
+            thumbnail_id: None,
+            defaults: ClipDefaults::default(),
+        }
     }
 }
 
@@ -63,6 +89,13 @@ impl Library {
 
     pub fn cell(&self, row: usize, col: usize) -> Option<&ClipSlot> {
         self.idx(row, col).and_then(|i| self.cells[i].as_ref())
+    }
+
+    /// Mutable accessor — used by the bottom panel to write per-clip
+    /// `ClipDefaults` (loop / speed / blend defaults).
+    pub fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut ClipSlot> {
+        let i = self.idx(row, col)?;
+        self.cells[i].as_mut()
     }
 
     /// Place a clip at `(row, col)`. Returns the previous occupant, if any
@@ -163,5 +196,21 @@ mod tests {
         let lib = Library::new(0, 0);
         assert_eq!(lib.layers(), 1);
         assert_eq!(lib.columns(), 1);
+    }
+
+    #[test]
+    fn clip_defaults_are_loop_speed1_normal() {
+        let d = ClipDefaults::default();
+        assert!(d.looping);
+        assert_eq!(d.speed, 1.0);
+        assert_eq!(d.blend, BlendMode::Normal);
+    }
+
+    #[test]
+    fn cell_mut_round_trips_a_default_change() {
+        let mut lib = Library::new(1, 1);
+        lib.set(0, 0, slot("x"));
+        lib.cell_mut(0, 0).expect("present").defaults.looping = false;
+        assert!(!lib.cell(0, 0).unwrap().defaults.looping);
     }
 }
