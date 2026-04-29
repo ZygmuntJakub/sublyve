@@ -76,6 +76,14 @@ Triggering a clip auto-selects its layer in the right-hand inspector.
 | Esc   | output  | leave fullscreen                                                 |
 | Esc   | control | clear cue (or quit if nothing cued)                              |
 
+## Composition size (runtime)
+
+The left panel's **Composition** section has `+`/`−` buttons for layer and column count. Add a layer → audio stream is rebuilt with one extra mixer source (preserving every existing layer's gain / mute settings). Remove a layer or column → clips and audio handles in the dropped row / column are released; if a layer was playing from a column you just removed, that layer goes empty. Limits: **1–16 layers**, **1–32 columns**.
+
+The CLI's `--layers N --columns M` still sets the *initial* size at boot. The runtime UI lets you grow / shrink the grid mid-session without losing the current performance state on surviving cells.
+
+Project files store the layer / column counts; loading a saved project resizes the running composition to match (any extra layers are dropped, missing layers are created with default settings).
+
 ## Quick controls
 
 Each layer's row in the grid has a Resolume-style quick-controls strip on the left, between the row label and the cell columns:

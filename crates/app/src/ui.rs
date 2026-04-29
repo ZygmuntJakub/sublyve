@@ -86,6 +86,11 @@ pub struct UiActions {
     /// Layer scrub bar — seek the layer's decoder to the given
     /// position in seconds. Right-click resets to 0 (= restart).
     pub seek_layer: Option<(usize, f64)>,
+    /// Composition resize buttons.
+    pub add_layer: bool,
+    pub remove_layer: bool,
+    pub add_column: bool,
+    pub remove_column: bool,
 }
 
 pub struct UiContext<'a> {
@@ -105,6 +110,11 @@ pub struct UiContext<'a> {
     pub audio_devices: &'a [String],
     pub current_audio_device: Option<&'a str>,
     pub master_volume: f32,
+    /// Hard limits for the +/- buttons in the Composition section so
+    /// the UI can disable them at the boundaries (which match
+    /// `MAX_LAYERS` / `MAX_COLUMNS` in main.rs).
+    pub max_layers: usize,
+    pub max_columns: usize,
 }
 
 pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
@@ -268,6 +278,77 @@ fn left_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     ui.add_space(6.0);
 
     audio_settings_section(ui, ctx, actions);
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    composition_section(ui, ctx, actions);
+}
+
+fn composition_section(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    ui.heading("Composition");
+    ui.add_space(4.0);
+
+    let layer_count = ctx.layers.len();
+    let column_count = ctx.library.columns();
+
+    composition_row(ui, "Layers", layer_count, ctx.max_layers, |which| match which {
+        ResizeButton::Add => actions.add_layer = true,
+        ResizeButton::Remove => actions.remove_layer = true,
+    });
+    composition_row(ui, "Columns", column_count, ctx.max_columns, |which| {
+        match which {
+            ResizeButton::Add => actions.add_column = true,
+            ResizeButton::Remove => actions.remove_column = true,
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "Removing a layer drops the topmost row; removing a column \
+             drops the rightmost. Clips in dropped cells are lost.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
+enum ResizeButton {
+    Add,
+    Remove,
+}
+
+fn composition_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: usize,
+    max: usize,
+    mut emit: impl FnMut(ResizeButton),
+) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        // Numeric value, fixed-width so the buttons don't dance
+        // when the count goes from 1 → 2 → 9 → 10.
+        ui.add_sized(
+            egui::vec2(28.0, 18.0),
+            egui::Label::new(egui::RichText::new(count.to_string()).strong())
+                .selectable(false),
+        );
+        if ui
+            .add_enabled(count > 1, egui::Button::new("−").min_size(egui::vec2(24.0, 22.0)))
+            .clicked()
+        {
+            emit(ResizeButton::Remove);
+        }
+        if ui
+            .add_enabled(count < max, egui::Button::new("+").min_size(egui::vec2(24.0, 22.0)))
+            .clicked()
+        {
+            emit(ResizeButton::Add);
+        }
+    });
 }
 
 fn audio_settings_section(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {

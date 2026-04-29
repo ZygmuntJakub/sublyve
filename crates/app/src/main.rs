@@ -37,6 +37,12 @@ const OUTPUT_DEFAULT_SIZE: LogicalSize<u32> = LogicalSize::new(1280, 720);
 
 const DEFAULT_LAYERS: usize = 4;
 const DEFAULT_COLUMNS: usize = 8;
+/// Hard limits on composition size. Higher values trash the egui
+/// layout (cells get too small to read) and stress the main-thread
+/// decode loop; ranges are pickable via the +/- buttons in the
+/// left-panel Composition section.
+pub const MAX_LAYERS: usize = 16;
+pub const MAX_COLUMNS: usize = 32;
 
 /// Real-time video playback / compositing engine.
 ///
@@ -931,6 +937,8 @@ impl AppState {
             audio_devices: &audio_devices,
             current_audio_device: self.audio_engine.current_device_name(),
             master_volume: self.audio_engine.master_volume(),
+            max_layers: MAX_LAYERS,
+            max_columns: MAX_COLUMNS,
         };
         let actions = ui::draw_control(&self.control.egui_ctx, ui_ctx);
 
@@ -1062,6 +1070,19 @@ impl AppState {
             && let Some(l) = self.composition.layers.get_mut(idx) {
                 l.seek(&self.gpu, secs);
             }
+
+        if actions.add_layer {
+            self.add_layer();
+        }
+        if actions.remove_layer {
+            self.remove_layer();
+        }
+        if actions.add_column {
+            self.add_column();
+        }
+        if actions.remove_column {
+            self.remove_column();
+        }
         if let Some(v) = actions.set_master_volume {
             self.audio_engine.set_master_volume(v);
         }
@@ -1209,6 +1230,118 @@ impl AppState {
         }
     }
 
+    /// Append a new layer to the composition + library, then rebuild
+    /// the audio stream so the new layer gets a producer handle.
+    /// Refuses past `MAX_LAYERS` (the +/- buttons are also
+    /// `add_enabled`-gated, but we keep the guard here for safety).
+    fn add_layer(&mut self) {
+        if self.composition.layers.len() >= MAX_LAYERS {
+            return;
+        }
+        let cfg = self.audio_engine.audio_config();
+        self.composition
+            .layers
+            .push(Layer::new_pending_audio(&self.gpu, cfg));
+        self.library.add_layer(MAX_LAYERS);
+        self.rebuild_audio_for_current_device();
+    }
+
+    /// Drop the highest-indexed layer (= the row visually at the top
+    /// of the grid). Frees the dropped library row's egui textures,
+    /// resets `selected_layer` / `cued` / `hovered_cell` if they
+    /// referenced that row, and rebuilds the audio stream so the
+    /// remaining layers each get a fresh producer handle.
+    fn remove_layer(&mut self) {
+        if self.composition.layers.len() <= 1 {
+            return;
+        }
+        let removed_idx = self.composition.layers.len() - 1;
+
+        // Drop the audio + decoder for the removed layer first.
+        self.composition.layers.pop();
+
+        // Drop the library row + free its egui textures.
+        for slot in self.library.remove_layer().into_iter().flatten() {
+            if let Some(id) = slot.thumbnail_id {
+                self.control.egui_renderer.free_texture(&id);
+            }
+        }
+
+        // Repair UI / state references to the dropped row.
+        if self.selected_layer == Some(removed_idx) {
+            self.selected_layer = if removed_idx > 0 {
+                Some(removed_idx - 1)
+            } else {
+                None
+            };
+        }
+        if let Some((r, _)) = self.cued
+            && r >= self.composition.layers.len()
+        {
+            self.clear_cue();
+        }
+        if let Some((r, _)) = self.hovered_cell
+            && r >= self.composition.layers.len()
+        {
+            self.hovered_cell = None;
+        }
+
+        self.rebuild_audio_for_current_device();
+    }
+
+    /// Append an empty column on the right of the grid. No audio
+    /// involvement — columns only exist in the library.
+    fn add_column(&mut self) {
+        self.library.add_column(MAX_COLUMNS);
+    }
+
+    /// Drop the rightmost column. Frees egui textures of any clips
+    /// that lived in it, clears the active clip on any layer that
+    /// was playing from that column, and clears the cue if it was
+    /// pointing into that column.
+    fn remove_column(&mut self) {
+        if self.library.columns() <= 1 {
+            return;
+        }
+        let dropped_col = self.library.columns() - 1;
+        for slot in self.library.remove_column().into_iter().flatten() {
+            if let Some(id) = slot.thumbnail_id {
+                self.control.egui_renderer.free_texture(&id);
+            }
+        }
+        // Layers that were playing from the now-gone column have a
+        // dangling `active_col` pointing at it; clear them so the
+        // grid's `▶` badge doesn't render off-grid.
+        for layer in self.composition.layers.iter_mut() {
+            if layer.active_col == Some(dropped_col) {
+                layer.clear();
+            }
+        }
+        if let Some((_, c)) = self.cued
+            && c >= self.library.columns()
+        {
+            self.clear_cue();
+        }
+        if let Some((_, c)) = self.hovered_cell
+            && c >= self.library.columns()
+        {
+            self.hovered_cell = None;
+        }
+    }
+
+    /// Tear down + rebuild the audio stream on whatever device is
+    /// currently active. Used after layer-add / layer-remove since
+    /// those change the consumer count baked into the cpal callback.
+    fn rebuild_audio_for_current_device(&mut self) {
+        let device = self.audio_engine.current_device_name().map(str::to_owned);
+        if let Err(e) = self
+            .audio_engine
+            .switch_device(&mut self.composition.layers, device.as_deref())
+        {
+            warn!("audio rebuild after layer count change failed: {e:#}");
+        }
+    }
+
     /// Reset every layer + drop the entire library, freeing per-clip
     /// egui textures along the way. Used as the first step of
     /// `apply_project` so the load starts from a clean slate.
@@ -1252,6 +1385,39 @@ impl AppState {
                 want.0, want.1
             );
         }
+
+        // Resize layer / column count to match the saved project.
+        // Layer changes rebuild the audio stream once after the loop;
+        // column changes are library-only.
+        let target_layers = project.library.layers.clamp(1, MAX_LAYERS);
+        while self.composition.layers.len() < target_layers {
+            let cfg = self.audio_engine.audio_config();
+            self.composition
+                .layers
+                .push(Layer::new_pending_audio(&self.gpu, cfg));
+            self.library.add_layer(MAX_LAYERS);
+        }
+        while self.composition.layers.len() > target_layers {
+            self.composition.layers.pop();
+            for slot in self.library.remove_layer().into_iter().flatten() {
+                if let Some(id) = slot.thumbnail_id {
+                    self.control.egui_renderer.free_texture(&id);
+                }
+            }
+        }
+        let target_columns = project.library.columns.clamp(1, MAX_COLUMNS);
+        while self.library.columns() < target_columns {
+            self.library.add_column(MAX_COLUMNS);
+        }
+        while self.library.columns() > target_columns {
+            for slot in self.library.remove_column().into_iter().flatten() {
+                if let Some(id) = slot.thumbnail_id {
+                    self.control.egui_renderer.free_texture(&id);
+                }
+            }
+        }
+        // Audio stream rebuild after every layer-count change.
+        self.rebuild_audio_for_current_device();
 
         // Output: monitor + fullscreen. Monitor is best-effort by
         // index — if the requested index is out of range now we just

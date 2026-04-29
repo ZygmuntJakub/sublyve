@@ -125,6 +125,78 @@ impl Library {
         }
         None
     }
+
+    /// Append a new empty layer row (one empty cell per existing
+    /// column). Returns `false` if at the hard limit.
+    pub fn add_layer(&mut self, max_layers: usize) -> bool {
+        if self.layers >= max_layers {
+            return false;
+        }
+        for _ in 0..self.columns {
+            self.cells.push(None);
+        }
+        self.layers += 1;
+        true
+    }
+
+    /// Drop the highest-indexed layer (= the row visually at the top
+    /// of the grid). Returns the cells from that row so the caller
+    /// can free their egui texture ids; returns an empty vec when at
+    /// the minimum (one row is always required).
+    pub fn remove_layer(&mut self) -> Vec<Option<ClipSlot>> {
+        if self.layers <= 1 {
+            return Vec::new();
+        }
+        let last_start = (self.layers - 1) * self.columns;
+        let dropped: Vec<Option<ClipSlot>> = self.cells.drain(last_start..).collect();
+        self.layers -= 1;
+        dropped
+    }
+
+    /// Append a new empty column on the right. Returns `false` if at
+    /// the hard limit.
+    pub fn add_column(&mut self, max_columns: usize) -> bool {
+        if self.columns >= max_columns {
+            return false;
+        }
+        let layers = self.layers;
+        let old_cols = self.columns;
+        let new_cols = old_cols + 1;
+        let mut new_cells = Vec::with_capacity(layers * new_cols);
+        for row in 0..layers {
+            for col in 0..old_cols {
+                new_cells.push(self.cells[row * old_cols + col].take());
+            }
+            new_cells.push(None);
+        }
+        self.cells = new_cells;
+        self.columns = new_cols;
+        true
+    }
+
+    /// Drop the rightmost column. Returns the dropped cells so the
+    /// caller can free their egui texture ids and detect which
+    /// layers had their active clip removed. Returns an empty vec
+    /// when at the minimum (one column is always required).
+    pub fn remove_column(&mut self) -> Vec<Option<ClipSlot>> {
+        if self.columns <= 1 {
+            return Vec::new();
+        }
+        let layers = self.layers;
+        let old_cols = self.columns;
+        let new_cols = old_cols - 1;
+        let mut dropped = Vec::with_capacity(layers);
+        let mut new_cells = Vec::with_capacity(layers * new_cols);
+        for row in 0..layers {
+            for col in 0..new_cols {
+                new_cells.push(self.cells[row * old_cols + col].take());
+            }
+            dropped.push(self.cells[row * old_cols + new_cols].take());
+        }
+        self.cells = new_cells;
+        self.columns = new_cols;
+        dropped
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +283,90 @@ mod tests {
         lib.set(0, 0, slot("x"));
         lib.cell_mut(0, 0).expect("present").defaults.looping = false;
         assert!(!lib.cell(0, 0).unwrap().defaults.looping);
+    }
+
+    #[test]
+    fn add_layer_appends_empty_row() {
+        let mut lib = Library::new(2, 3);
+        lib.set(1, 2, slot("top-right"));
+        assert!(lib.add_layer(8));
+        assert_eq!(lib.layers(), 3);
+        assert_eq!(lib.columns(), 3);
+        // Existing data preserved.
+        assert_eq!(lib.cell(1, 2).expect("kept").name, "top-right.mp4");
+        // New row is fully empty.
+        assert!(lib.cell(2, 0).is_none());
+        assert!(lib.cell(2, 1).is_none());
+        assert!(lib.cell(2, 2).is_none());
+    }
+
+    #[test]
+    fn add_layer_respects_max() {
+        let mut lib = Library::new(4, 2);
+        assert!(!lib.add_layer(4));
+        assert_eq!(lib.layers(), 4);
+    }
+
+    #[test]
+    fn remove_layer_drops_last_row_and_returns_clips() {
+        let mut lib = Library::new(3, 2);
+        lib.set(2, 0, slot("a"));
+        lib.set(2, 1, slot("b"));
+        let dropped = lib.remove_layer();
+        assert_eq!(lib.layers(), 2);
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(dropped[0].as_ref().unwrap().name, "a.mp4");
+        assert_eq!(dropped[1].as_ref().unwrap().name, "b.mp4");
+    }
+
+    #[test]
+    fn remove_layer_keeps_minimum_of_one() {
+        let mut lib = Library::new(1, 4);
+        lib.set(0, 0, slot("only"));
+        let dropped = lib.remove_layer();
+        assert!(dropped.is_empty());
+        assert_eq!(lib.layers(), 1);
+        assert_eq!(lib.cell(0, 0).expect("preserved").name, "only.mp4");
+    }
+
+    #[test]
+    fn add_column_inserts_at_end_of_each_row() {
+        let mut lib = Library::new(2, 2);
+        lib.set(0, 0, slot("a"));
+        lib.set(0, 1, slot("b"));
+        lib.set(1, 1, slot("c"));
+        assert!(lib.add_column(8));
+        assert_eq!(lib.columns(), 3);
+        // Existing cells stay where they were.
+        assert_eq!(lib.cell(0, 0).expect("a").name, "a.mp4");
+        assert_eq!(lib.cell(0, 1).expect("b").name, "b.mp4");
+        assert_eq!(lib.cell(1, 1).expect("c").name, "c.mp4");
+        // New column is empty.
+        assert!(lib.cell(0, 2).is_none());
+        assert!(lib.cell(1, 2).is_none());
+    }
+
+    #[test]
+    fn remove_column_drops_rightmost_and_returns_clips() {
+        let mut lib = Library::new(2, 3);
+        lib.set(0, 2, slot("right-top"));
+        lib.set(1, 0, slot("left-bot"));
+        let dropped = lib.remove_column();
+        assert_eq!(lib.columns(), 2);
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(dropped[0].as_ref().unwrap().name, "right-top.mp4");
+        assert!(dropped[1].is_none()); // bottom-right was empty
+        // Surviving cells.
+        assert_eq!(lib.cell(1, 0).expect("kept").name, "left-bot.mp4");
+    }
+
+    #[test]
+    fn remove_column_keeps_minimum_of_one() {
+        let mut lib = Library::new(2, 1);
+        lib.set(0, 0, slot("only"));
+        let dropped = lib.remove_column();
+        assert!(dropped.is_empty());
+        assert_eq!(lib.columns(), 1);
+        assert_eq!(lib.cell(0, 0).expect("preserved").name, "only.mp4");
     }
 }

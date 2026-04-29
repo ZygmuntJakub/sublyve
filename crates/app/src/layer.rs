@@ -72,6 +72,15 @@ impl Layer {
         Self::build(gpu, Some(audio), Some(audio_config))
     }
 
+    /// Build a layer that already knows its audio config but doesn't
+    /// have a producer handle yet. Used when adding a layer at
+    /// runtime — the caller pushes this layer onto `composition.layers`
+    /// and immediately calls `AudioEngine::switch_device(...)`, which
+    /// allocates a fresh ring buffer and calls `replace_audio_handle`.
+    pub fn new_pending_audio(gpu: &GpuContext, audio_config: AudioConfig) -> Self {
+        Self::build(gpu, None, Some(audio_config))
+    }
+
     fn build(
         gpu: &GpuContext,
         audio: Option<AudioLayerHandle>,
