@@ -227,6 +227,45 @@ impl Layer {
         }
     }
 
+    /// Seek the layer to `secs` (in source time) without changing the
+    /// playing/looping state. Used by the inspector's scrub bar.
+    ///
+    /// Decodes + uploads one frame **inline** so the seek is visible
+    /// even on paused layers — without this, a paused layer's texture
+    /// would keep showing the pre-seek frame because `tick` returns
+    /// early when `transport.playing` is false. Audio for the new
+    /// position is also queued into the ring buffer.
+    pub fn seek(&mut self, gpu: &GpuContext, secs: f64) {
+        let target = secs.max(0.0);
+        let Some(decoder) = self.decoder.as_mut() else {
+            return;
+        };
+        if let Err(e) = decoder.seek(target) {
+            warn!("layer seek failed: {e}");
+            return;
+        }
+        self.transport.position = target;
+        self.catchup = 0.0;
+
+        // FFmpeg seeks to the keyframe at or before the requested
+        // time, so the first frame back will have PTS <= target. We
+        // upload it anyway and let `transport.position` reflect what
+        // actually got decoded; the slider snaps to the keyframe on
+        // the next render. Acceptable visual behaviour for scrubbing.
+        match decoder.next_frame() {
+            Ok(Some(frame)) => {
+                self.transport.position = frame.pts;
+                self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
+            }
+            Ok(None) => {
+                // EOF immediately after seeking past the end of the
+                // stream; leave the previous frame in place.
+            }
+            Err(e) => warn!("post-seek decode failed: {e}"),
+        }
+        self.flush_audio_to_ring();
+    }
+
     /// Pump the decoder for `dt` seconds of wall-clock time. Uploads the
     /// freshest decoded frame to the layer's `VideoTexture` and drains
     /// any decoded audio into the ring buffer. Drops the catch-up to

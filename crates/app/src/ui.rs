@@ -83,6 +83,9 @@ pub struct UiActions {
     /// strip. Multiplies into both the visual opacity uniform and the
     /// audio mix gain.
     pub set_layer_master: Option<(usize, f32)>,
+    /// Layer scrub bar — seek the layer's decoder to the given
+    /// position in seconds. Right-click resets to 0 (= restart).
+    pub seek_layer: Option<(usize, f64)>,
 }
 
 pub struct UiContext<'a> {
@@ -138,6 +141,20 @@ pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
         .show(ctx, |ui| grid_panel(ui, &ui_ctx, &mut actions));
 
     actions
+}
+
+/// `M:SS` (or `H:MM:SS` past an hour). Used by the layer inspector's
+/// scrub bar so position / duration read like a normal media player.
+fn format_time(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// Slider convention: right-click resets to a sensible default. Given
@@ -456,8 +473,29 @@ fn right_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) 
     }
 
     ui.add_space(8.0);
+
+    // Scrub bar: a normal-player-style timeline. The slider is bound
+    // to a local mut that starts at the layer's current position; egui
+    // moves it to the cursor while the user clicks / drags, and we
+    // emit a seek action on every change. Right-click jumps to 0
+    // (== restart-but-don't-touch-playing-state). On empty layers we
+    // disable it instead of hiding it so the inspector layout doesn't
+    // jump when a clip is loaded.
     if let Some(info) = layer.info {
-        ui.label(format!("{:>6.2}s / {:>6.2}s", layer.position, info.duration));
+        let duration = info.duration.max(0.001);
+        let mut pos = layer.position.clamp(0.0, duration);
+        let resp = ui.add_enabled(
+            has_clip,
+            egui::Slider::new(&mut pos, 0.0..=duration).show_value(false),
+        );
+        if let Some(v) = slider_value_after(resp, &mut pos, 0.0) {
+            actions.seek_layer = Some((layer.index, v));
+        }
+        ui.label(format!("{} / {}", format_time(layer.position), format_time(info.duration)));
+    } else {
+        let mut zero = 0.0_f64;
+        ui.add_enabled(false, egui::Slider::new(&mut zero, 0.0..=1.0).show_value(false));
+        ui.label(egui::RichText::new("— / —").weak());
     }
 
     ui.add_space(10.0);

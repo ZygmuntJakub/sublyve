@@ -1058,6 +1058,10 @@ impl AppState {
             && let Some(l) = self.composition.layers.get_mut(idx) {
                 l.clear();
             }
+        if let Some((idx, secs)) = actions.seek_layer
+            && let Some(l) = self.composition.layers.get_mut(idx) {
+                l.seek(&self.gpu, secs);
+            }
         if let Some(v) = actions.set_master_volume {
             self.audio_engine.set_master_volume(v);
         }

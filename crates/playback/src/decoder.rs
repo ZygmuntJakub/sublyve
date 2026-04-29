@@ -246,8 +246,16 @@ impl Decoder {
     /// Seek to (approximately) `timestamp_secs` and flush both decoders.
     /// The next decoded video frame will have a PTS at or after the
     /// requested time; pending audio is dropped.
+    ///
+    /// `Input::seek` (which wraps `avformat_seek_file` with
+    /// `stream_index = -1`) expects the target timestamp in
+    /// `AV_TIME_BASE` units — microseconds, *not* the per-stream
+    /// `time_base`. The previous version of this method used the
+    /// stream time_base, which sent FFmpeg the wrong target on every
+    /// call; only restarts (`seek(0.0)`) happened to behave correctly
+    /// because zero is zero in any unit.
     pub fn seek(&mut self, timestamp_secs: f64) -> Result<(), AvError> {
-        let ts = (timestamp_secs / rational_as_f64(self.video_time_base)) as i64;
+        let ts = (timestamp_secs.max(0.0) * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
         self.input.seek(ts, ..ts).map_err(AvError::ffmpeg)?;
         self.video_decoder.flush();
         self.video_drained = false;

@@ -87,7 +87,9 @@ Each layer's row in the grid has a Resolume-style quick-controls strip on the le
 
 The right-panel layer inspector still has the same controls with numeric labels for fine adjustment; both UIs bind to the same atomics, so changes are visible in both places live.
 
-**Right-click any slider** (quick strip, layer inspector, master volume, per-clip default speed) to snap it back to its default (`1.0` everywhere).
+**Right-click any slider** (quick strip, layer inspector, master volume, per-clip default speed, seek bar) to snap it back to its default (`1.0` everywhere; the seek bar resets to `0:00`).
+
+The right-panel **layer inspector** also has a regular media-player **scrub bar** (under Speed) — drag it to seek, click anywhere on it to jump there, right-click to restart. The position / duration label below shows `M:SS / M:SS` (or `H:MM:SS` past an hour).
 
 ## Save / Load project
 
