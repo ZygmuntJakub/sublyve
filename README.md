@@ -45,10 +45,10 @@ Drag video files onto cells in the grid to add them to the library. `RUST_LOG=de
 
 Two windows:
 
-- **Control** (`avengine — control`) — top transport bar; central clip grid (rows = layers, cols = columns); left panel with the live **Output** preview, the **Cue** preview, the **TAKE** button, and Output settings (monitor + fullscreen); right panel with the **Layer settings** for whichever layer you've selected (click an `L0`/`L1`/… row label on the left of the grid); bottom panel with the **Clip inspector** for whichever cell is currently in the cue.
+- **Control** (`avengine — control`) — top transport bar; central clip grid (rows = layers, cols = columns); right panel **tabbed** (`Preview` / `Video` / `Audio` / `Project`) — Preview shows the live **Output** preview, the **Cue** preview, and the **TAKE** button; Video has the output monitor + fullscreen settings; Audio has device routing + master volume; Project has the composition setup (layer / column count, composition resolution). Bottom panel is **tabbed** (`Layer` / `Clip`) — Layer tab shows the inspector for whichever layer you've selected (click an `L0`/`L1`/… row label on the left of the grid), Clip tab shows the inspector for whichever cell is currently in the cue. The bottom panel auto-switches tab based on the action you just took: shift+click a cell (cue) → Clip tab; click a cell (trigger) or click a layer row label → Layer tab.
 - **Output** (`avengine — output`) — clean composition, no overlay. Drag onto a projector and press `F`.
 
-**Clip inspector (bottom panel).** The cue parks on a cell — filled or empty — and the bottom panel takes its cue from there:
+**Clip inspector (bottom panel · Clip tab).** The cue parks on a cell — filled or empty — and the Clip tab takes its cue from there:
 
 - **Empty cell cued** → shows a `Browse…` button that opens a native file dialog (`rfd`); the picked file imports into the cell, and the panel auto-switches to the metadata view on the next frame.
 - **Filled cell cued** → shows the clip's thumbnail, name, full path, source size, and per-clip default settings (loop / speed / blend). Defaults are applied every time the clip is triggered onto its layer; you can still override them mid-play from the right-hand layer inspector.
@@ -57,12 +57,12 @@ Two windows:
 **Click semantics.**
 
 - **Click** a cell → trigger that clip on its layer (loads + plays immediately).
-- **Shift+click** a cell → cue it: the clip plays on a hidden preview deck so you can preview it in the **Cue** pane without sending it to output. The TAKE button (or `Enter`) then promotes the cued clip to its real layer.
+- **Shift+click** a cell → cue it: the clip plays on a hidden preview deck so you can preview it in the **Cue** pane (right panel · Preview tab) without sending it to output. The TAKE button (or `Enter`) then promotes the cued clip to its real layer.
 - **Right-click** a cell → stop the layer that owns the cell.
 - **Double-click** is the same as click (kept for muscle memory).
 - **Drag** a video file onto a cell → import it into that cell. If the cell's layer is currently empty, the new clip auto-triggers on it.
 
-Triggering a clip auto-selects its layer in the right-hand inspector.
+Triggering a clip auto-selects its layer in the Layer tab.
 
 **Shortcuts:**
 
@@ -78,7 +78,7 @@ Triggering a clip auto-selects its layer in the right-hand inspector.
 
 ## Composition size (runtime)
 
-The left panel's **Composition** section has `+`/`−` buttons for layer and column count. Add a layer → audio stream is rebuilt with one extra mixer source (preserving every existing layer's gain / mute settings). Remove a layer or column → clips and audio handles in the dropped row / column are released; if a layer was playing from a column you just removed, that layer goes empty. Limits: **1–16 layers**, **1–32 columns**.
+The right panel's **Project** tab has the **Composition** section with `+`/`−` buttons for layer and column count. Add a layer → audio stream is rebuilt with one extra mixer source (preserving every existing layer's gain / mute settings). Remove a layer or column → clips and audio handles in the dropped row / column are released; if a layer was playing from a column you just removed, that layer goes empty. Limits: **1–16 layers**, **1–32 columns**.
 
 The CLI's `--layers N --columns M` still sets the *initial* size at boot. The runtime UI lets you grow / shrink the grid mid-session without losing the current performance state on surviving cells.
 
@@ -93,11 +93,11 @@ Each layer's row in the grid has a Resolume-style quick-controls strip on the le
 - **Opa** — vertical fader for the layer's video opacity (0.0–1.0).
 - **Mst** — **master fade** (0.0–1.0). Multiplies into both the visual opacity uniform *and* the audio mix gain at the same time, like a DJ channel fader. Drag to 0 → the whole layer fades to black and silent simultaneously, regardless of its individual opacity / volume settings.
 
-The right-panel layer inspector still has the same controls with numeric labels for fine adjustment; both UIs bind to the same atomics, so changes are visible in both places live.
+The Layer tab in the bottom panel has the same controls with numeric labels for fine adjustment; both UIs bind to the same atomics, so changes are visible in both places live.
 
 **Right-click any slider** (quick strip, layer inspector, master volume, per-clip default speed, seek bar) to snap it back to its default (`1.0` everywhere; the seek bar resets to `0:00`).
 
-The right-panel **layer inspector** also has a regular media-player **scrub bar** (under Speed) — drag it to seek, click anywhere on it to jump there, right-click to restart. The position / duration label below shows `M:SS / M:SS` (or `H:MM:SS` past an hour).
+The Layer tab also has a regular media-player **scrub bar** (under Speed) — drag it to seek, click anywhere on it to jump there, right-click to restart. The position / duration label below shows `M:SS / M:SS` (or `H:MM:SS` past an hour).
 
 ## Save / Load project
 
@@ -131,10 +131,10 @@ The last-project path lives in the OS config directory:
 
 Each layer decodes both the video and audio streams of its clip in a single FFmpeg pass; audio is resampled to **48 kHz f32 stereo** and pushed into a per-layer SPSC ring buffer (`ringbuf 0.4`). A `cpal` output stream — opened on the default device or whichever `--audio-device` names — runs a real-time callback that pulls from every layer's buffer, multiplies by the per-layer gain, sums, and applies a master volume + clamp.
 
-- **Per-layer audio gain** in the right-hand layer inspector (0.0 – 2.0).
+- **Per-layer audio gain** in the bottom panel's Layer tab (0.0 – 2.0).
 - **Per-layer mute** silences both video and audio.
-- **Master volume** in the left-panel Audio section.
-- **Device selection**: at startup via `--audio-device <name>` (use `--list-audio-devices` to discover names), or live from the left-panel **Audio · Output** combobox. Switching mid-session drops the active cpal stream, allocates fresh per-layer ring buffers (preserving each layer's gain / mute settings via the shared `Arc<AudioLayerControl>`), and builds a new stream — a brief audio gap, no app stall.
+- **Master volume** on the right panel's **Audio** tab.
+- **Device selection**: at startup via `--audio-device <name>` (use `--list-audio-devices` to discover names), or live from the **Audio · Output** combobox on the same tab. Switching mid-session drops the active cpal stream, allocates fresh per-layer ring buffers (preserving each layer's gain / mute settings via the shared `Arc<AudioLayerControl>`), and builds a new stream — a brief audio gap, no app stall.
 - Clips with no audio stream are silently skipped on the audio side; their video plays normally.
 
 Audio + video are not yet PTS-locked — they share a wall-clock pump driven by the video frame rate, so they'll drift over very long clips. For tight A/V sync (PTS-driven master clock) see the roadmap.

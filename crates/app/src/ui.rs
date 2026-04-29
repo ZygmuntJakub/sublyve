@@ -4,6 +4,30 @@ use winit::monitor::MonitorHandle;
 
 use crate::library::Library;
 
+/// Which inspector the tabbed bottom panel currently shows. Auto-
+/// switches based on the user's last meaningful action (cue → Clip,
+/// trigger / select_layer → Layer); manual tab clicks override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
+pub enum BottomTab {
+    #[default]
+    Layer,
+    Clip,
+}
+
+/// Which section the right (settings) panel currently shows. Manual
+/// switching only — config-style tabs, no auto-switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
+pub enum RightTab {
+    #[default]
+    Preview,
+    Video,
+    Audio,
+    Project,
+}
+
+
 /// Read-only snapshot of one layer that the UI renders.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerView<'a> {
@@ -91,6 +115,12 @@ pub struct UiActions {
     pub remove_layer: bool,
     pub add_column: bool,
     pub remove_column: bool,
+    /// Bottom panel tab change from a manual header click. Auto-
+    /// switches (`cue` / `trigger` / `select_layer`) write directly
+    /// to `AppState::bottom_tab` and don't go through this.
+    pub set_bottom_tab: Option<BottomTab>,
+    /// Right (settings) panel tab change from a manual header click.
+    pub set_right_tab: Option<RightTab>,
 }
 
 pub struct UiContext<'a> {
@@ -115,6 +145,10 @@ pub struct UiContext<'a> {
     /// `MAX_LAYERS` / `MAX_COLUMNS` in main.rs).
     pub max_layers: usize,
     pub max_columns: usize,
+    /// Which tab the bottom panel should render this frame.
+    pub bottom_tab: BottomTab,
+    /// Which tab the right (settings) panel should render this frame.
+    pub right_tab: RightTab,
 }
 
 pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
@@ -125,26 +159,26 @@ pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
         .frame(panel_frame(255))
         .show(ctx, |ui| transport_bar(ui, &ui_ctx, &mut actions));
 
-    egui::SidePanel::left("avengine.left")
+    // Settings panel on the right hosts the previously-left-panel
+    // content (Output preview + Cue + TAKE + Output settings + Audio +
+    // Composition) — one place for all the per-session config.
+    egui::SidePanel::right("avengine.settings")
         .resizable(true)
         .default_width(300.0)
         .min_width(240.0)
         .frame(panel_frame(255))
-        .show(ctx, |ui| left_panel(ui, &ui_ctx, &mut actions));
+        .show(ctx, |ui| settings_panel(ui, &ui_ctx, &mut actions));
 
-    egui::SidePanel::right("avengine.right")
+    // Tabbed bottom panel: Layer inspector + Clip inspector share
+    // the space, switched by the tab header. Default ~240 px is
+    // enough for the Layer tab's transport / scrub / audio sections
+    // without scrolling on a typical control window.
+    egui::TopBottomPanel::bottom("avengine.bottom")
         .resizable(true)
-        .default_width(280.0)
-        .min_width(220.0)
+        .default_height(240.0)
+        .min_height(160.0)
         .frame(panel_frame(255))
-        .show(ctx, |ui| right_panel(ui, &ui_ctx, &mut actions));
-
-    egui::TopBottomPanel::bottom("avengine.clip_inspector")
-        .resizable(true)
-        .default_height(170.0)
-        .min_height(120.0)
-        .frame(panel_frame(255))
-        .show(ctx, |ui| clip_inspector(ui, &ui_ctx, &mut actions));
+        .show(ctx, |ui| bottom_tabs(ui, &ui_ctx, &mut actions));
 
     egui::CentralPanel::default()
         .frame(panel_frame(255))
@@ -238,7 +272,50 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
     });
 }
 
-fn left_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+fn settings_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    let mut chosen = ctx.right_tab;
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut chosen, RightTab::Preview, "Preview");
+        ui.selectable_value(&mut chosen, RightTab::Video, "Video");
+        ui.selectable_value(&mut chosen, RightTab::Audio, "Audio");
+        ui.selectable_value(&mut chosen, RightTab::Project, "Project");
+    });
+    if chosen != ctx.right_tab {
+        actions.set_right_tab = Some(chosen);
+    }
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| match ctx.right_tab {
+            RightTab::Preview => right_preview_tab(ui, ctx, actions),
+            RightTab::Video => right_video_tab(ui, ctx, actions),
+            RightTab::Audio => right_audio_tab(ui, ctx, actions),
+            RightTab::Project => right_project_tab(ui, ctx, actions),
+        });
+}
+
+/// Header (tab buttons) + body dispatch for the tabbed bottom panel.
+/// Manual tab clicks emit `UiActions::set_bottom_tab`; auto-switches
+/// on `cue` / `trigger` / `select_layer` happen on the AppState side.
+fn bottom_tabs(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    let mut chosen = ctx.bottom_tab;
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut chosen, BottomTab::Layer, "Layer");
+        ui.selectable_value(&mut chosen, BottomTab::Clip, "Clip");
+    });
+    if chosen != ctx.bottom_tab {
+        actions.set_bottom_tab = Some(chosen);
+    }
+    ui.separator();
+    match ctx.bottom_tab {
+        BottomTab::Layer => layer_inspector_tab(ui, ctx, actions),
+        BottomTab::Clip => clip_inspector_tab(ui, ctx, actions),
+    }
+}
+
+/// Preview tab: live Output preview, Cue preview, and the TAKE button —
+/// the cluster the performer watches while triggering clips.
+fn right_preview_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     ui.heading("Output");
     if let Some(id) = ctx.output_texture {
         thumb_image(ui, id, ctx.output_aspect, ui.available_width());
@@ -266,23 +343,23 @@ fn left_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     if ui.add_enabled(take_enabled, take_btn).clicked() {
         actions.take = true;
     }
+}
 
-    ui.add_space(14.0);
-    ui.separator();
-    ui.add_space(6.0);
-
+/// Video tab: where the output composition is rendered (monitor +
+/// fullscreen). Audio routing has its own tab.
+fn right_video_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     output_settings_section(ui, ctx, actions);
+}
 
-    ui.add_space(10.0);
-    ui.separator();
-    ui.add_space(6.0);
-
+/// Audio tab: device selection + master volume.
+fn right_audio_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     audio_settings_section(ui, ctx, actions);
+}
 
-    ui.add_space(10.0);
-    ui.separator();
-    ui.add_space(6.0);
-
+/// Project tab: composition setup (layer count, column count,
+/// composition resolution). Project file Save/Open still live in the
+/// top transport bar.
+fn right_project_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     composition_section(ui, ctx, actions);
 }
 
@@ -445,13 +522,19 @@ fn thumb_placeholder(ui: &mut egui::Ui, width: f32, aspect: f32, label: &str) {
     );
 }
 
-fn right_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+fn layer_inspector_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| layer_inspector_body(ui, ctx, actions));
+}
+
+fn layer_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     let Some(idx) = ctx.selected_layer else {
         ui.heading("Layer");
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
-                "Click a row label (L0, L1, …) on the left of the grid to inspect that layer.",
+                "Click a row label (L0, L1, …) in the grid to inspect that layer.",
             )
             .weak(),
         );
@@ -634,7 +717,13 @@ const MIN_CELL_W: f32 = 96.0;
 const QUICK_STRIP_W: f32 = 132.0;
 const QUICK_SLIDER_W: f32 = 32.0;
 
-fn clip_inspector(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+fn clip_inspector_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| clip_inspector_body(ui, ctx, actions));
+}
+
+fn clip_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
     match ctx.cued {
         None => clip_inspector_hint(ui),
         Some((r, c)) => match ctx.library.cell(r, c) {

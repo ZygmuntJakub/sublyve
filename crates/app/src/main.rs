@@ -273,6 +273,15 @@ struct AppState {
     /// Persistent app preferences. Mutated whenever the user saves
     /// or opens a project so the next launch can resume.
     config: config::AppConfig,
+
+    /// Which tab the bottom panel currently shows. Auto-switches on
+    /// `cue` / `trigger` / `select_layer`; manual tab clicks come in
+    /// via `UiActions::set_bottom_tab`.
+    bottom_tab: ui::BottomTab,
+
+    /// Which tab the right (settings) panel currently shows. Manual
+    /// switching only — config-style tabs.
+    right_tab: ui::RightTab,
 }
 
 struct ControlWindow {
@@ -441,6 +450,8 @@ impl AppState {
             bound_composition_gen: u64::MAX,
             audio_engine,
             config: app_config,
+            bottom_tab: ui::BottomTab::default(),
+            right_tab: ui::RightTab::default(),
         };
 
         // Decide whether to auto-load a project. CLI args win over the
@@ -650,6 +661,9 @@ impl AppState {
             return;
         }
         self.cued = Some((row, col));
+        // Auto-switch the bottom panel to the Clip tab so the user
+        // sees the inspector / browse for the cell they just cued.
+        self.bottom_tab = ui::BottomTab::Clip;
         if let Some(slot) = self.library.cell(row, col) {
             let path = slot.path.clone();
             let defaults = slot.defaults;
@@ -695,6 +709,8 @@ impl AppState {
             return;
         }
         self.selected_layer = Some(row);
+        // The user just acted on a layer — show its inspector.
+        self.bottom_tab = ui::BottomTab::Layer;
     }
 
     fn stop_layer(&mut self, row: usize) {
@@ -939,6 +955,8 @@ impl AppState {
             master_volume: self.audio_engine.master_volume(),
             max_layers: MAX_LAYERS,
             max_columns: MAX_COLUMNS,
+            bottom_tab: self.bottom_tab,
+            right_tab: self.right_tab,
         };
         let actions = ui::draw_control(&self.control.egui_ctx, ui_ctx);
 
@@ -1033,7 +1051,15 @@ impl AppState {
         if let Some(idx) = actions.select_layer
             && idx < self.composition.layers.len() {
                 self.selected_layer = Some(idx);
+                // Pick a row label → focus the layer inspector.
+                self.bottom_tab = ui::BottomTab::Layer;
             }
+        if let Some(t) = actions.set_bottom_tab {
+            self.bottom_tab = t;
+        }
+        if let Some(t) = actions.set_right_tab {
+            self.right_tab = t;
+        }
 
         if let Some((r, c)) = actions.trigger_cell {
             // Triggering directly clears any pending cue — the user is
