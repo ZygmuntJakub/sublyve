@@ -1,8 +1,19 @@
 use avengine_core::BlendMode;
-use avengine_playback::StreamInfo;
+use avengine_playback::{CameraDevice, StreamInfo};
 use winit::monitor::MonitorHandle;
 
 use crate::library::Library;
+
+/// Drag payload set when the user starts a drag from a Camera-tab row;
+/// taken by the grid `cell_widget` drop target. Carries everything we
+/// need to reconstruct the camera cell on drop.
+#[derive(Debug, Clone)]
+pub struct CameraDragPayload {
+    pub format_name: String,
+    pub device: String,
+    pub display_name: String,
+    pub has_audio: bool,
+}
 
 /// Which inspector the tabbed bottom panel currently shows. Auto-
 /// switches based on the user's last meaningful action (cue → Clip,
@@ -13,6 +24,7 @@ pub enum BottomTab {
     #[default]
     Layer,
     Clip,
+    Camera,
 }
 
 /// Which section the right (settings) panel currently shows. Manual
@@ -50,6 +62,9 @@ pub struct LayerView<'a> {
     pub active_name: Option<&'a str>,
     /// Per-layer audio gain (1.0 = unity).
     pub audio_gain: f32,
+    /// True when the active source is a live capture device (camera).
+    /// UI gates the scrub bar / loop checkbox / speed slider on this.
+    pub is_live: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -121,6 +136,12 @@ pub struct UiActions {
     pub set_bottom_tab: Option<BottomTab>,
     /// Right (settings) panel tab change from a manual header click.
     pub set_right_tab: Option<RightTab>,
+    /// Refresh the enumerated camera list (Camera tab "🔄" button).
+    pub refresh_cameras: bool,
+    /// User dropped a Camera-tab payload onto a grid cell — bind the
+    /// cell to that camera. Auto-triggers if the layer was empty.
+    /// Tuple: `(row, col, format_name, device, display_name, has_audio)`.
+    pub bind_camera_to_cell: Option<(usize, usize, String, String, String, bool)>,
 }
 
 pub struct UiContext<'a> {
@@ -149,6 +170,8 @@ pub struct UiContext<'a> {
     pub bottom_tab: BottomTab,
     /// Which tab the right (settings) panel should render this frame.
     pub right_tab: RightTab,
+    /// Live capture devices the user can drag onto grid cells.
+    pub cameras: &'a [CameraDevice],
 }
 
 pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
@@ -302,6 +325,7 @@ fn bottom_tabs(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) 
     ui.horizontal(|ui| {
         ui.selectable_value(&mut chosen, BottomTab::Layer, "Layer");
         ui.selectable_value(&mut chosen, BottomTab::Clip, "Clip");
+        ui.selectable_value(&mut chosen, BottomTab::Camera, "Camera");
     });
     if chosen != ctx.bottom_tab {
         actions.set_bottom_tab = Some(chosen);
@@ -310,6 +334,7 @@ fn bottom_tabs(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) 
     match ctx.bottom_tab {
         BottomTab::Layer => layer_inspector_tab(ui, ctx, actions),
         BottomTab::Clip => clip_inspector_tab(ui, ctx, actions),
+        BottomTab::Camera => camera_inspector_tab(ui, ctx, actions),
     }
 }
 
@@ -617,49 +642,62 @@ fn layer_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut Ui
         }
     });
 
-    let mut looping = layer.looping;
-    if ui
-        .add_enabled(has_clip, egui::Checkbox::new(&mut looping, "Loop"))
-        .changed()
-    {
-        actions.set_layer_looping = Some((layer.index, looping));
-    }
+    // Loop / speed / scrub are meaningless for live capture sources
+    // (cameras don't seek); skip the whole block when the active clip
+    // is live. The right-panel layer-tab inspector then shows just
+    // the visual / audio mixer controls.
+    if layer.is_live {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("📷 Live source — loop, speed, and scrub disabled.")
+                .small()
+                .weak(),
+        );
+    } else {
+        let mut looping = layer.looping;
+        if ui
+            .add_enabled(has_clip, egui::Checkbox::new(&mut looping, "Loop"))
+            .changed()
+        {
+            actions.set_layer_looping = Some((layer.index, looping));
+        }
 
-    let mut speed = layer.speed;
-    let resp = ui.add_enabled(
-        has_clip,
-        egui::Slider::new(&mut speed, 0.1..=4.0)
-            .text("Speed")
-            .logarithmic(true),
-    );
-    if let Some(v) = slider_value_after(resp, &mut speed, 1.0) {
-        actions.set_layer_speed = Some((layer.index, v));
-    }
-
-    ui.add_space(8.0);
-
-    // Scrub bar: a normal-player-style timeline. The slider is bound
-    // to a local mut that starts at the layer's current position; egui
-    // moves it to the cursor while the user clicks / drags, and we
-    // emit a seek action on every change. Right-click jumps to 0
-    // (== restart-but-don't-touch-playing-state). On empty layers we
-    // disable it instead of hiding it so the inspector layout doesn't
-    // jump when a clip is loaded.
-    if let Some(info) = layer.info {
-        let duration = info.duration.max(0.001);
-        let mut pos = layer.position.clamp(0.0, duration);
+        let mut speed = layer.speed;
         let resp = ui.add_enabled(
             has_clip,
-            egui::Slider::new(&mut pos, 0.0..=duration).show_value(false),
+            egui::Slider::new(&mut speed, 0.1..=4.0)
+                .text("Speed")
+                .logarithmic(true),
         );
-        if let Some(v) = slider_value_after(resp, &mut pos, 0.0) {
-            actions.seek_layer = Some((layer.index, v));
+        if let Some(v) = slider_value_after(resp, &mut speed, 1.0) {
+            actions.set_layer_speed = Some((layer.index, v));
         }
-        ui.label(format!("{} / {}", format_time(layer.position), format_time(info.duration)));
-    } else {
-        let mut zero = 0.0_f64;
-        ui.add_enabled(false, egui::Slider::new(&mut zero, 0.0..=1.0).show_value(false));
-        ui.label(egui::RichText::new("— / —").weak());
+
+        ui.add_space(8.0);
+
+        // Scrub bar: a normal-player-style timeline. The slider is bound
+        // to a local mut that starts at the layer's current position; egui
+        // moves it to the cursor while the user clicks / drags, and we
+        // emit a seek action on every change. Right-click jumps to 0
+        // (== restart-but-don't-touch-playing-state). On empty layers we
+        // disable it instead of hiding it so the inspector layout doesn't
+        // jump when a clip is loaded.
+        if let Some(info) = layer.info {
+            let duration = info.duration.max(0.001);
+            let mut pos = layer.position.clamp(0.0, duration);
+            let resp = ui.add_enabled(
+                has_clip,
+                egui::Slider::new(&mut pos, 0.0..=duration).show_value(false),
+            );
+            if let Some(v) = slider_value_after(resp, &mut pos, 0.0) {
+                actions.seek_layer = Some((layer.index, v));
+            }
+            ui.label(format!("{} / {}", format_time(layer.position), format_time(info.duration)));
+        } else {
+            let mut zero = 0.0_f64;
+            ui.add_enabled(false, egui::Slider::new(&mut zero, 0.0..=1.0).show_value(false));
+            ui.label(egui::RichText::new("— / —").weak());
+        }
     }
 
     ui.add_space(10.0);
@@ -721,6 +759,99 @@ fn clip_inspector_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiAc
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| clip_inspector_body(ui, ctx, actions));
+}
+
+/// Camera tab in the bottom panel: list of enumerated capture devices,
+/// each row a drag source. Drop a row onto a grid cell to bind that
+/// cell to the camera.
+fn camera_inspector_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| camera_inspector_body(ui, ctx, actions));
+}
+
+fn camera_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    ui.horizontal(|ui| {
+        ui.heading("Cameras");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("🔄  Refresh").clicked() {
+                actions.refresh_cameras = true;
+            }
+        });
+    });
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("Drag a camera onto a grid cell to bind it.")
+            .small()
+            .weak(),
+    );
+    ui.add_space(8.0);
+
+    if ctx.cameras.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "No cameras detected. Plug one in and click Refresh.",
+            )
+            .weak(),
+        );
+        return;
+    }
+
+    for cam in ctx.cameras.iter() {
+        let resp = camera_row(ui, cam);
+        // egui's drag-drop API: when the user starts dragging this
+        // row, set our typed payload on the global drag state. The
+        // drop target (cell_widget) takes it on release.
+        if resp.dragged() {
+            egui::DragAndDrop::set_payload(
+                ui.ctx(),
+                CameraDragPayload {
+                    format_name: cam.format_name.clone(),
+                    device: cam.device.clone(),
+                    display_name: cam.display_name.clone(),
+                    has_audio: cam.has_audio,
+                },
+            );
+        }
+        // Visualise the drag with a tooltip-style label that follows
+        // the cursor — egui doesn't paint anything by default.
+        if resp.dragged() {
+            egui::popup::show_tooltip_at_pointer(
+                ui.ctx(),
+                ui.layer_id(),
+                egui::Id::new(("camera-drag-tip", &cam.device)),
+                |ui| {
+                    ui.label(format!("📷 {}", cam.display_name));
+                },
+            );
+        }
+    }
+}
+
+fn camera_row(ui: &mut egui::Ui, cam: &CameraDevice) -> egui::Response {
+    // Allocate a row of fixed height that's both clickable and
+    // draggable so we get a `dragged()` signal from one widget.
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 30.0),
+        egui::Sense::click_and_drag(),
+    );
+    let visuals = ui.style().interact(&resp);
+    ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+    ui.painter().rect_stroke(rect, 4.0, visuals.bg_stroke);
+
+    let text_pos = rect.left_center() + egui::vec2(8.0, 0.0);
+    ui.painter().text(
+        text_pos,
+        egui::Align2::LEFT_CENTER,
+        format!(
+            "📷  {}  {}",
+            cam.display_name,
+            if cam.has_audio { "(audio)" } else { "(no audio)" }
+        ),
+        egui::TextStyle::Body.resolve(ui.style()),
+        visuals.text_color(),
+    );
+    resp
 }
 
 fn clip_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
@@ -798,11 +929,13 @@ fn clip_metadata_inspector(
         // Right column: metadata + defaults editors.
         ui.vertical(|ui| {
             ui.heading(&slot.name);
-            ui.label(
-                egui::RichText::new(slot.path.display().to_string())
-                    .small()
-                    .weak(),
-            );
+            let source_label = match &slot.source {
+                crate::library::CellSource::File { path } => path.display().to_string(),
+                crate::library::CellSource::Camera { format_name, device, .. } => {
+                    format!("📷 {format_name} · {device}")
+                }
+            };
+            ui.label(egui::RichText::new(source_label).small().weak());
             if let Some(thumb) = slot.thumbnail.as_ref() {
                 let (w, h) = thumb.size();
                 ui.label(
@@ -822,21 +955,23 @@ fn clip_metadata_inspector(
                     .weak(),
             );
 
-            // Default loop.
-            let mut looping = slot.defaults.looping;
-            if ui.checkbox(&mut looping, "Loop").changed() {
-                actions.set_clip_default_loop = Some(((row, col), looping));
-            }
+            // Loop / speed are meaningless for live capture — hide
+            // them and only show the blend selector for camera cells.
+            if !slot.source.is_live() {
+                let mut looping = slot.defaults.looping;
+                if ui.checkbox(&mut looping, "Loop").changed() {
+                    actions.set_clip_default_loop = Some(((row, col), looping));
+                }
 
-            // Default speed.
-            let mut speed = slot.defaults.speed;
-            let resp = ui.add(
-                egui::Slider::new(&mut speed, 0.1..=4.0)
-                    .text("Speed")
-                    .logarithmic(true),
-            );
-            if let Some(v) = slider_value_after(resp, &mut speed, 1.0) {
-                actions.set_clip_default_speed = Some(((row, col), v));
+                let mut speed = slot.defaults.speed;
+                let resp = ui.add(
+                    egui::Slider::new(&mut speed, 0.1..=4.0)
+                        .text("Speed")
+                        .logarithmic(true),
+                );
+                if let Some(v) = slider_value_after(resp, &mut speed, 1.0) {
+                    actions.set_clip_default_speed = Some(((row, col), v));
+                }
             }
 
             // Default blend.
@@ -1074,6 +1209,16 @@ fn cell_widget(
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+        } else if c.source.is_live() {
+            // Camera cells don't have a thumbnail; render a camera
+            // glyph centred in the thumbnail area instead.
+            painter.text(
+                thumb_area.center(),
+                egui::Align2::CENTER_CENTER,
+                "📷",
+                egui::FontId::proportional(28.0),
+                egui::Color32::from_gray(200),
+            );
         } else {
             painter.text(
                 thumb_area.center(),
@@ -1117,6 +1262,28 @@ fn cell_widget(
 
     if response.hovered() {
         actions.hovered_cell = Some((row, col));
+    }
+
+    // Drop target for the Camera-tab drag source. If a camera payload
+    // is currently in flight and our cell is hovered, paint a subtle
+    // accept-highlight; on pointer release, take the payload and emit
+    // the bind action.
+    let camera_drag_in_flight =
+        egui::DragAndDrop::has_payload_of_type::<CameraDragPayload>(ui.ctx());
+    if camera_drag_in_flight && response.hovered() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            egui::Rounding::same(6.0),
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 200, 255)),
+        );
+        if ui.input(|i| i.pointer.any_released())
+            && let Some(payload) =
+                egui::DragAndDrop::take_payload::<CameraDragPayload>(ui.ctx())
+        {
+            let p = (*payload).clone();
+            actions.bind_camera_to_cell =
+                Some((row, col, p.format_name, p.device, p.display_name, p.has_audio));
+        }
     }
 
     // Click semantics:

@@ -97,15 +97,23 @@ The Layer tab in the bottom panel has the same controls with numeric labels for 
 
 **Right-click any slider** (quick strip, layer inspector, master volume, per-clip default speed, seek bar) to snap it back to its default (`1.0` everywhere; the seek bar resets to `0:00`).
 
-The Layer tab also has a regular media-player **scrub bar** (under Speed) — drag it to seek, click anywhere on it to jump there, right-click to restart. The position / duration label below shows `M:SS / M:SS` (or `H:MM:SS` past an hour).
+The Layer tab also has a regular media-player **scrub bar** (under Speed) — drag it to seek, click anywhere on it to jump there, right-click to restart. The position / duration label below shows `M:SS / M:SS` (or `H:MM:SS` past an hour). Scrub bar / loop / speed are hidden when the active source is a live capture device (camera) since live streams aren't seekable.
+
+## Camera inputs
+
+USB webcams (and any FFmpeg-supported capture device) appear in the **Camera** tab in the bottom panel — third tab, next to Layer / Clip. Drag a camera entry onto a grid cell to bind it; the cell now triggers / cues / TAKEs / saves like a clip cell, the cell renders a 📷 glyph instead of a thumbnail, and the camera's mic feeds the layer's audio path automatically (when a paired audio device exists). Clicking the cell triggers the camera onto its layer; right-click stops the layer; shift+click cues it on the preview deck. Hit **🔄 Refresh** if you plug in a camera mid-session — V1 doesn't auto-detect hotplug.
+
+For *live layers* (those playing a camera), the Layer-tab inspector hides loop / speed / scrub since none apply. The Clip-tab inspector for a camera cell hides the loop / speed defaults editors but keeps the blend selector. Per-clip defaults still apply at trigger time (only `blend` is honoured for live cells).
+
+Enumeration uses FFmpeg's `avdevice_list_input_sources` API — `avfoundation` on macOS (paired video+mic), `v4l2` on Linux (video only — alsa mic separate, not paired in V1), `dshow` on Windows. Camera identity is persisted by `format_name + device + display_name`; on project load the cell rebinds best-effort against whatever's currently enumerated and skips with a warning if unavailable. Cueing a camera opens the device twice (preview deck + main worker) — fine on macOS / Linux v4l2 with multi-reader support, may fail on platforms with exclusive camera access.
 
 ## Save / Load project
 
-`💾 Save…` and `📂 Open…` in the top transport bar persist the workspace as a JSON project file (`.sublyve.json`). The format is human-readable and version-stamped (`{ "version": 2, "project": { … } }`); the loader rejects newer versions with a clear error rather than misinterpreting fields. Older versions still load — `version: 1` files (no `master` field on layers) come in with master defaulting to 1.0.
+`💾 Save…` and `📂 Open…` in the top transport bar persist the workspace as a JSON project file (`.sublyve.json`). The format is human-readable and version-stamped (`{ "version": 3, "project": { … } }`); the loader rejects newer versions with a clear error rather than misinterpreting fields. Older versions still load — `version: 1` files (no `master` field on layers) come in with master defaulting to 1.0; `version: 2` files (cells held a bare `path` field) migrate cells into `source: { type: "File", path: … }` on load.
 
 What's saved:
 
-- **Library cells**: every occupied `(row, col)` with its absolute path and per-clip defaults (loop / speed / blend).
+- **Library cells**: every occupied `(row, col)` with its source — `File { path }` for video files (absolute path) or `Camera { format_name, device, display_name }` for live capture devices — and per-clip defaults (loop / speed / blend; loop and speed are silently ignored at trigger time for camera cells).
 - **Per-layer compositing**: `blend_mode`, `opacity`, `mute`, `audio_gain`, and `master` (added in schema v2) for every layer.
 - **Composition**: target width × height. Loading resizes the offscreen target if it differs.
 - **Output**: monitor index (best-effort by index across reboots), fullscreen flag.
@@ -118,7 +126,7 @@ What's deliberately **not** saved (the file represents your *setup*, not a perfo
 
 A "snapshot" / scene system that captures active state for choreographed recall is a deliberate future milestone — different concept from a project file.
 
-**Path policy**: absolute paths in V1. If a saved clip's source file has moved or been deleted, the loader logs a warning and skips that cell; the rest still load.
+**Path policy**: absolute paths in V1. If a saved clip's source file has moved or been deleted, the loader logs a warning and skips that cell; the rest still load. Camera cells likewise log a warning and skip if the saved device no longer enumerates (unplugged, renamed).
 
 **Auto-resume on startup**: launching with no arguments reopens the last project you saved or opened. Override with `--no-resume` (start with an empty workspace) or `--project /path/to/file.sublyve.json` (open that specific file). CLI clip arguments still win — `cargo run -- foo.mp4` always preloads `foo.mp4` and skips auto-resume.
 
@@ -144,15 +152,14 @@ Audio + video are not yet PTS-locked — they share a wall-clock pump driven by 
 - **Premultiplied alpha throughout.** The fragment shader emits `vec4(rgb * a, a)` where `a = src.a * opacity`, so the four blend states (`Normal`, `Add`, `Multiply`, `Screen`) all behave correctly under the per-layer opacity slider with no per-mode shader branching.
 - **One pipeline per blend mode.** Switching modes is a `set_pipeline` call, not a uniform tweak; blend state is baked into the pipeline.
 - **Composition target is fixed.** The output surface blits the composition target letterboxed to fit. The control window samples the same texture inside an egui `Image` for the live Output preview pane (registered once via `egui_wgpu::Renderer::register_native_texture`). Resizing windows doesn't reallocate GPU memory; only `--composition-size` does.
-- **One decoder per layer (V1: main thread).** `Layer::tick` runs each layer's send-packet / receive-frame loop with `send_eof` + drain. Frame rate is read from each clip's container (`avg_frame_rate`).
-- **Sync decode budget.** ~5 ms per layer per frame on Apple silicon for 1080p H.264 → 4 layers @ 30 fps comfortably hits vsync. 60 fps clips, 4K layers, or 6+ layers will start dropping frames; threaded decode is the next milestone.
+- **One decoder per layer, on its own worker thread.** `Layer::load` spawns a dedicated OS thread that owns the `Decoder` outright; the worker pushes decoded frames into a 3-deep bounded `sync_channel`, and the main thread (`Layer::tick`) only pops frames + uploads them to the GPU. Backpressure from the bounded channel paces decode at source frame rate; pausing a layer stops its decode work entirely (worker blocks on `send`). Each clip's frame rate comes from its container (`avg_frame_rate`).
+- **Decode parallelism.** Decoders run concurrently on as many cores as there are loaded layers — 6+ layers at 1080p / 60 fps clips no longer choke the main thread. Audio samples are drained from the worker straight into the per-layer `ringbuf` (already SPSC, lock-free) without crossing back through the main thread.
 - **Color.** Video uploaded as `Rgba8UnormSrgb`, composition target same, surface picked sRGB. Symmetric sRGB↔linear at every stage; matches egui's pipeline.
 - **`unsafe` count.** Zero in our code. The egui render-pass crossing uses `RenderPass::forget_lifetime`.
 - **Errors.** Libs use `AvError` (`thiserror`); the binary uses `anyhow` at the boundary. Surface acquisition handles `Lost`/`Outdated`/`Timeout` instead of panicking.
 
 ## Roadmap
 
-- [ ] **Threaded decode** — one worker per layer with a bounded frame channel. Mandatory before pushing past ~4×1080p layers or any 60 fps content.
 - [ ] **PTS-locked A/V sync** — drive layer playback off the audio stream's master clock so very long clips don't drift.
 - [ ] **Snapshots / scenes** — capture active clip + transport state per layer for choreographed recall. Different concept from a project file (which is the *setup*, not a moment).
 - [ ] **Recent files** menu and Cmd+S resaves to the current file.

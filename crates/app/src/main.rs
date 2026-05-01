@@ -1,6 +1,7 @@
 mod audio;
 mod composition;
 mod config;
+mod decode_worker;
 mod layer;
 mod library;
 mod project;
@@ -24,9 +25,10 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, WindowAttributes, WindowId};
 
+use avengine_playback::CameraDevice;
 use composition::Composition;
 use layer::Layer;
-use library::{ClipSlot, Library};
+use library::{CellSource, ClipSlot, Library};
 use ui::{LayerView, UiActions, UiContext};
 
 /// Cap on per-tick wall-clock catch-up after a stall (window hidden, etc.).
@@ -282,6 +284,11 @@ struct AppState {
     /// Which tab the right (settings) panel currently shows. Manual
     /// switching only — config-style tabs.
     right_tab: ui::RightTab,
+
+    /// Live capture devices enumerated at startup and on Refresh. The
+    /// Camera tab in the bottom panel renders this list as drag
+    /// sources; project-load matches saved camera cells against it.
+    cameras: Vec<CameraDevice>,
 }
 
 struct ControlWindow {
@@ -452,6 +459,10 @@ impl AppState {
             config: app_config,
             bottom_tab: ui::BottomTab::default(),
             right_tab: ui::RightTab::default(),
+            cameras: avengine_playback::cameras::list().unwrap_or_else(|e| {
+                warn!("camera enumeration failed at startup: {e:#}");
+                Vec::new()
+            }),
         };
 
         // Decide whether to auto-load a project. CLI args win over the
@@ -496,10 +507,16 @@ impl AppState {
                     break;
                 }
             }
-            if let Some(slot) = state.library.cell(0, 0) {
-                let path = slot.path.clone();
+            // Trigger the freshly-imported clip on layer 0 (CLI clips
+            // can only be files, so File-source dispatch only).
+            if let Some(slot) = state.library.cell(0, 0)
+                && let CellSource::File { path } = &slot.source
+            {
+                let path = path.clone();
                 let defaults = slot.defaults;
-                if let Err(e) = state.composition.layers[0].load(&state.gpu, &path, 0, defaults) {
+                if let Err(e) =
+                    state.composition.layers[0].load(&state.gpu, &path, 0, defaults)
+                {
                     error!("failed to load layer 0: {e:#}");
                 }
             }
@@ -651,6 +668,48 @@ impl AppState {
         Ok(())
     }
 
+    /// Place a camera-source slot at `(row, col)`. No thumbnail
+    /// extraction (would require opening the device); the cell renders
+    /// a glyph + display_name instead.
+    fn import_camera(
+        &mut self,
+        format_name: String,
+        device: String,
+        display_name: String,
+        has_audio: bool,
+        row: usize,
+        col: usize,
+    ) -> Result<()> {
+        let slot = ClipSlot::from_camera(
+            format_name.clone(),
+            device.clone(),
+            display_name.clone(),
+            has_audio,
+        );
+        if let Some(prev) = self.library.set(row, col, slot)
+            && let Some(id) = prev.thumbnail_id
+        {
+            self.control.egui_renderer.free_texture(&id);
+        }
+        info!(
+            "imported camera [{}, {}] {} ({}, audio={})",
+            row, col, display_name, device, has_audio,
+        );
+        Ok(())
+    }
+
+    /// Re-enumerate camera devices. Called from the Camera tab's
+    /// Refresh button (and at startup via `AppState::new`).
+    fn refresh_cameras(&mut self) {
+        match avengine_playback::cameras::list() {
+            Ok(list) => {
+                info!("camera refresh: {} device(s)", list.len());
+                self.cameras = list;
+            }
+            Err(e) => warn!("camera refresh failed: {e:#}"),
+        }
+    }
+
     /// Park `(row, col)` in the cue. If the cell is filled the clip
     /// starts playing on the preview deck; if it's empty the preview
     /// deck is cleared and the bottom inspector switches to its
@@ -665,9 +724,27 @@ impl AppState {
         // sees the inspector / browse for the cell they just cued.
         self.bottom_tab = ui::BottomTab::Clip;
         if let Some(slot) = self.library.cell(row, col) {
-            let path = slot.path.clone();
             let defaults = slot.defaults;
-            if let Err(e) = self.preview.load(&self.gpu, &path, col, defaults) {
+            let load_result = match &slot.source {
+                CellSource::File { path } => {
+                    let path = path.clone();
+                    self.preview.load(&self.gpu, &path, col, defaults)
+                }
+                CellSource::Camera { format_name, device, has_audio, .. } => {
+                    let format_name = format_name.clone();
+                    let device = device.clone();
+                    let has_audio = *has_audio;
+                    self.preview.load_camera(
+                        &self.gpu,
+                        &format_name,
+                        &device,
+                        has_audio,
+                        col,
+                        defaults,
+                    )
+                }
+            };
+            if let Err(e) = load_result {
                 error!("preview load failed: {e:#}");
                 self.preview.clear();
             }
@@ -702,9 +779,27 @@ impl AppState {
             warn!("trigger: row {row} out of layer range");
             return;
         };
-        let path = slot.path.clone();
         let defaults = slot.defaults;
-        if let Err(e) = layer.load(&self.gpu, &path, col, defaults) {
+        let load_result = match &slot.source {
+            CellSource::File { path } => {
+                let path = path.clone();
+                layer.load(&self.gpu, &path, col, defaults)
+            }
+            CellSource::Camera { format_name, device, has_audio, .. } => {
+                let format_name = format_name.clone();
+                let device = device.clone();
+                let has_audio = *has_audio;
+                layer.load_camera(
+                    &self.gpu,
+                    &format_name,
+                    &device,
+                    has_audio,
+                    col,
+                    defaults,
+                )
+            }
+        };
+        if let Err(e) = load_result {
             error!("trigger load failed: {e:#}");
             return;
         }
@@ -909,6 +1004,7 @@ impl AppState {
                     .active_col
                     .and_then(|c| self.library.cell(idx, c).map(|s| s.name.as_str())),
                 audio_gain: l.audio_gain(),
+                is_live: l.is_live,
             })
             .collect();
         let composition_playing = self.composition.any_playing();
@@ -957,6 +1053,7 @@ impl AppState {
             max_columns: MAX_COLUMNS,
             bottom_tab: self.bottom_tab,
             right_tab: self.right_tab,
+            cameras: &self.cameras,
         };
         let actions = ui::draw_control(&self.control.egui_ctx, ui_ctx);
 
@@ -1132,7 +1229,7 @@ impl AppState {
             }
         if let Some((i, looping)) = actions.set_layer_looping
             && let Some(l) = self.composition.layers.get_mut(i) {
-                l.transport.looping = looping;
+                l.set_looping(looping);
             }
         if let Some((i, sp)) = actions.set_layer_speed
             && let Some(l) = self.composition.layers.get_mut(i) {
@@ -1166,6 +1263,33 @@ impl AppState {
 
         if let Some((row, col)) = actions.browse_for_cell {
             self.browse_into_cell(row, col);
+        }
+        if actions.refresh_cameras {
+            self.refresh_cameras();
+        }
+        if let Some((row, col, format_name, device, display_name, has_audio)) =
+            actions.bind_camera_to_cell
+        {
+            if let Err(e) = self.import_camera(
+                format_name,
+                device,
+                display_name,
+                has_audio,
+                row,
+                col,
+            ) {
+                error!("camera bind failed: {e:#}");
+            } else if self
+                .composition
+                .layers
+                .get(row)
+                .is_some_and(|l| l.is_empty())
+            {
+                // Mirror the file-drag-drop "auto-trigger on empty
+                // layer" UX so dropping a camera onto an idle row
+                // immediately starts streaming it.
+                self.trigger(row, col);
+            }
         }
         if let Some(((r, c), looping)) = actions.set_clip_default_loop
             && let Some(slot) = self.library.cell_mut(r, c)
@@ -1497,17 +1621,58 @@ impl AppState {
         let mut imported = 0usize;
         let mut skipped = 0usize;
         for cell in &project.library.cells {
-            if !cell.path.exists() {
-                warn!(
-                    "skipping missing clip at L{}/C{}: {}",
-                    cell.row,
-                    cell.col,
-                    cell.path.display()
-                );
-                skipped += 1;
-                continue;
-            }
-            match self.import_clip(cell.path.clone(), cell.row, cell.col) {
+            let import_result = match &cell.source {
+                project::CellSpecSource::File { path } => {
+                    if !path.exists() {
+                        warn!(
+                            "skipping missing clip at L{}/C{}: {}",
+                            cell.row,
+                            cell.col,
+                            path.display()
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    self.import_clip(path.clone(), cell.row, cell.col)
+                }
+                project::CellSpecSource::Camera {
+                    format_name,
+                    device,
+                    display_name,
+                    has_audio,
+                } => {
+                    // Best-effort match against currently-enumerated
+                    // devices. We accept either an exact `device` URL
+                    // match or a fuzzy `display_name` match — devices
+                    // can change between sessions. Use the freshest
+                    // `has_audio` from current enumeration when we
+                    // find a match (the camera may have gained or
+                    // lost a paired mic since the project was saved);
+                    // fall back to the saved value otherwise.
+                    let matched = self.cameras.iter().find(|c| {
+                        c.format_name == *format_name
+                            && (c.device == *device || c.display_name == *display_name)
+                    });
+                    let Some(matched) = matched else {
+                        warn!(
+                            "skipping unavailable camera at L{}/C{}: {}",
+                            cell.row, cell.col, display_name,
+                        );
+                        skipped += 1;
+                        continue;
+                    };
+                    let live_has_audio = matched.has_audio || *has_audio;
+                    self.import_camera(
+                        format_name.clone(),
+                        device.clone(),
+                        display_name.clone(),
+                        live_has_audio,
+                        cell.row,
+                        cell.col,
+                    )
+                }
+            };
+            match import_result {
                 Ok(()) => {
                     if let Some(slot) = self.library.cell_mut(cell.row, cell.col) {
                         slot.defaults = cell.defaults;
@@ -1516,10 +1681,8 @@ impl AppState {
                 }
                 Err(e) => {
                     warn!(
-                        "failed to import {} into L{}/C{}: {e:#}",
-                        cell.path.display(),
-                        cell.row,
-                        cell.col
+                        "failed to import L{}/C{}: {e:#}",
+                        cell.row, cell.col
                     );
                     skipped += 1;
                 }

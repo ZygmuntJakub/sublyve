@@ -1,24 +1,27 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::Result;
 use avengine_compositor::{GpuContext, Uniforms, VideoPipelines, VideoTexture};
 use avengine_core::BlendMode;
 use avengine_playback::{AudioConfig, Decoder, StreamInfo, Transport};
-use ringbuf::traits::Observer;
-use tracing::{error, warn};
 use wgpu::util::DeviceExt;
 
-use crate::audio::AudioLayerHandle;
+use crate::audio::{AudioLayerHandle, AudioLayerProducer};
+use crate::decode_worker::{self, DecodedItem, DecoderCmd, FRAME_CHANNEL_CAPACITY};
 use crate::library::ClipDefaults;
-
-/// How aggressively the layer drains its decoder's pending audio
-/// samples into the SPSC ring buffer per `tick`. We try to keep the
-/// buffer at least half-full so the cpal callback never starves.
-const AUDIO_PUMP_TARGET_FILL: f32 = 0.5;
 
 /// One row of the grid: an independent decoder + transport that draws
 /// into the shared `CompositionTarget` with a chosen blend mode and
 /// opacity. Multiple `Layer`s play simultaneously and composite back-to-front.
+///
+/// Decoding runs on a dedicated worker thread (one per loaded layer);
+/// the worker pushes decoded frames into a small bounded channel that
+/// `tick` drains and uploads to the GPU. See `decode_worker.rs`.
 pub struct Layer {
     pub blend_mode: BlendMode,
     pub opacity: f32,
@@ -32,10 +35,13 @@ pub struct Layer {
     /// Column of the currently-loaded clip (or `None` if the layer is empty).
     pub active_col: Option<usize>,
 
+    /// True when the active source is a live capture device (camera).
+    /// Drives UI gates: hides scrub bar / loop / speed editors.
+    pub is_live: bool,
+
     pub transport: Transport,
     pub info: Option<StreamInfo>,
 
-    decoder: Option<Decoder>,
     frame_period: f64,
     /// Per-layer wall-clock catch-up accumulator. Bounded by the global
     /// `MAX_CATCHUP_SECS` clamp applied in `tick`.
@@ -48,15 +54,28 @@ pub struct Layer {
 
     uniforms_buffer: wgpu::Buffer,
 
-    /// Producer side of the per-layer audio ring buffer. Decoded +
-    /// resampled samples land here via `tick`; the cpal callback drains
-    /// them. `None` for the preview deck (which doesn't route to output).
+    /// Producer-side audio plumbing. The `producer` field is `None`
+    /// while a worker owns it (between `load` and `clear`); we get it
+    /// back via the worker's `JoinHandle` on shutdown.
     audio: Option<AudioLayerHandle>,
     /// Engine audio config — used by `Layer::load` to open the decoder
     /// with audio support matching the cpal stream.
     audio_config: Option<AudioConfig>,
-    /// Scratch buffer reused across pumps to avoid per-tick allocs.
-    audio_scratch: Vec<f32>,
+
+    // ---- Threaded decode plumbing (None when layer is empty) ----
+    /// Frames produced by the worker; popped by `tick`.
+    frame_rx: Option<Receiver<DecodedItem>>,
+    /// Commands to the worker (Seek / SwapAudioProducer / Stop).
+    cmd_tx: Option<Sender<DecoderCmd>>,
+    /// Worker handle. Joined in `clear` to reclaim the audio producer.
+    worker: Option<JoinHandle<Option<AudioLayerProducer>>>,
+    /// Generation tag — incremented on every Layer-side seek; the worker
+    /// echoes it on each frame, and `tick` drops items whose epoch is
+    /// older than this (those are pre-seek leftovers in the channel).
+    seek_epoch: u64,
+    /// Looping flag shared with the worker — read on EOF to decide
+    /// loop vs. stop. Cheaper than a command for a per-toggle flag.
+    looping_atomic: Arc<AtomicBool>,
 }
 
 impl Layer {
@@ -98,9 +117,9 @@ impl Layer {
             master: 1.0,
             mute: false,
             active_col: None,
+            is_live: false,
             transport: Transport::new(),
             info: None,
-            decoder: None,
             frame_period: 1.0 / 30.0,
             catchup: 0.0,
             video_texture,
@@ -109,7 +128,11 @@ impl Layer {
             uniforms_buffer,
             audio,
             audio_config,
-            audio_scratch: Vec::new(),
+            frame_rx: None,
+            cmd_tx: None,
+            worker: None,
+            seek_epoch: 0,
+            looping_atomic: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -137,19 +160,37 @@ impl Layer {
 
     /// Hand back the layer's current audio control so a stream rebuild
     /// can keep gain / mute settings stable across device switches.
-    pub fn audio_control(&self) -> Option<std::sync::Arc<crate::audio::AudioLayerControl>> {
+    pub fn audio_control(&self) -> Option<Arc<crate::audio::AudioLayerControl>> {
         self.audio.as_ref().map(|a| a.control.clone())
     }
 
     /// Swap in a new producer handle (after a stream rebuild) without
-    /// touching anything else on the layer. The caller is responsible
-    /// for keeping the matching consumer alive in the new cpal callback.
-    pub fn replace_audio_handle(&mut self, handle: AudioLayerHandle) {
+    /// touching anything else on the layer. If a worker is running, the
+    /// new producer is forwarded to it via a command; otherwise it gets
+    /// parked on the layer's `AudioLayerHandle` for the next clip load.
+    pub fn replace_audio_handle(&mut self, mut handle: AudioLayerHandle) {
+        if self.worker.is_some()
+            && let Some(prod) = handle.take_producer()
+            && let Some(tx) = self.cmd_tx.as_ref()
+        {
+            // Worker now owns this new producer; the AudioLayerHandle
+            // we keep on the layer holds only `control` while the
+            // worker is alive.
+            let _ = tx.send(DecoderCmd::SwapAudioProducer(Some(prod)));
+        }
         self.audio = Some(handle);
     }
 
+    /// Update both `transport.looping` (UI-visible) and the atomic the
+    /// decode worker reads on EOF. Use this rather than mutating
+    /// `transport.looping` directly so the worker sees the change.
+    pub fn set_looping(&mut self, looping: bool) {
+        self.transport.looping = looping;
+        self.looping_atomic.store(looping, Ordering::Relaxed);
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.decoder.is_none()
+        self.worker.is_none()
     }
 
     pub fn is_visible(&self) -> bool {
@@ -165,7 +206,8 @@ impl Layer {
     /// will reset them again.
     ///
     /// The first frame is decoded synchronously and uploaded to the
-    /// layer's `VideoTexture` so the next composition render isn't black.
+    /// layer's `VideoTexture` so the next composition render isn't black;
+    /// the worker thread then spawns to handle frames 2..N.
     pub fn load(
         &mut self,
         gpu: &GpuContext,
@@ -173,6 +215,10 @@ impl Layer {
         col: usize,
         defaults: ClipDefaults,
     ) -> Result<()> {
+        // Tear down any previously-running worker for this layer first
+        // (reclaims the audio producer onto self.audio).
+        self.stop_worker();
+
         // If we're wired into the audio engine, open with audio so the
         // decoder demuxes both streams in a single pass; otherwise the
         // existing video-only path keeps preview-deck loads cheap.
@@ -184,32 +230,126 @@ impl Layer {
         self.frame_period = 1.0 / info.frame_rate.max(1e-3);
         self.transport = Transport::new();
         self.transport.playing = true;
-        self.transport.looping = defaults.looping;
+        self.set_looping(defaults.looping);
         self.transport.speed = defaults.speed;
         self.blend_mode = defaults.blend;
         self.catchup = 0.0;
         self.active_col = Some(col);
+        self.is_live = false;
+        self.seek_epoch = 0;
+
+        // Decode + upload first frame inline so the cell isn't black for
+        // the first few ticks. Worker takes over from frame 2.
+        if let Some(frame) = decoder.next_frame()? {
+            self.transport.position = frame.pts;
+            self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
+        }
+        self.info = Some(info);
+
+        // Hand the audio producer (if any) to the worker.
+        let audio_producer = self.audio.as_mut().and_then(|a| a.take_producer());
+
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedItem>(FRAME_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<DecoderCmd>();
+        let worker = decode_worker::spawn(
+            decoder,
+            frame_tx,
+            cmd_rx,
+            self.looping_atomic.clone(),
+            audio_producer,
+        );
+
+        self.frame_rx = Some(frame_rx);
+        self.cmd_tx = Some(cmd_tx);
+        self.worker = Some(worker);
+        Ok(())
+    }
+
+    /// Load a *camera* (live capture device) into this layer. Same
+    /// flow as `load`, but goes through `Decoder::open_camera` and
+    /// hard-disables looping / non-1.0 speed (live streams aren't
+    /// seekable, and `defaults.looping` / `defaults.speed` are
+    /// silently ignored). `is_live` is set so the UI can hide its
+    /// scrub bar / loop / speed editors for this layer.
+    ///
+    /// `has_audio` comes from camera enumeration: when false, we don't
+    /// even ask the decoder to open audio, which avoids the spurious
+    /// "no audio stream" warning on video-only cams. When true and
+    /// the decoder still can't bring up audio (e.g. macOS Microphone
+    /// permission denied), the warning fires — that's a real signal.
+    pub fn load_camera(
+        &mut self,
+        gpu: &GpuContext,
+        format_name: &str,
+        device: &str,
+        has_audio: bool,
+        col: usize,
+        defaults: ClipDefaults,
+    ) -> Result<()> {
+        self.stop_worker();
+
+        let audio_cfg = if has_audio { self.audio_config } else { None };
+        let mut decoder = Decoder::open_camera(format_name, device, audio_cfg)?;
+        let info = decoder.info();
+        self.frame_period = 1.0 / info.frame_rate.max(1e-3);
+        self.transport = Transport::new();
+        self.transport.playing = true;
+        self.set_looping(false);
+        self.transport.speed = 1.0;
+        self.blend_mode = defaults.blend;
+        self.catchup = 0.0;
+        self.active_col = Some(col);
+        self.is_live = true;
+        self.seek_epoch = 0;
 
         if let Some(frame) = decoder.next_frame()? {
             self.transport.position = frame.pts;
             self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
         }
-
         self.info = Some(info);
-        self.decoder = Some(decoder);
 
-        // Pump any audio that was demuxed alongside the first video
-        // frame into the ring buffer so playback starts in sync.
-        self.flush_audio_to_ring();
+        let audio_producer = self.audio.as_mut().and_then(|a| a.take_producer());
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedItem>(FRAME_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<DecoderCmd>();
+        let worker = decode_worker::spawn(
+            decoder,
+            frame_tx,
+            cmd_rx,
+            self.looping_atomic.clone(),
+            audio_producer,
+        );
+
+        self.frame_rx = Some(frame_rx);
+        self.cmd_tx = Some(cmd_tx);
+        self.worker = Some(worker);
         Ok(())
     }
 
+    /// Stop the worker thread (if any) and reclaim the audio producer.
+    fn stop_worker(&mut self) {
+        if let Some(tx) = self.cmd_tx.take() {
+            let _ = tx.send(DecoderCmd::Stop);
+        }
+        // Drop the receiver — if the worker is blocked on `send`, this
+        // unblocks it with a disconnect error and it exits cleanly.
+        self.frame_rx = None;
+        if let Some(handle) = self.worker.take()
+            && let Ok(returned) = handle.join()
+            && let Some(prod) = returned
+            && let Some(audio) = self.audio.as_mut()
+        {
+            audio.set_producer(prod);
+        }
+    }
+
     pub fn clear(&mut self) {
-        self.decoder = None;
+        self.stop_worker();
         self.info = None;
         self.active_col = None;
+        self.is_live = false;
         self.transport.playing = false;
         self.catchup = 0.0;
+        self.seek_epoch = 0;
         // Stale audio in the ring buffer would briefly play after the
         // next clip is loaded; we accept up to ~340 ms of glitching
         // here for V1 (ringbuf 0.4 producer has no clear-from-this-side
@@ -226,141 +366,156 @@ impl Layer {
     }
 
     pub fn restart(&mut self) {
-        if let Some(d) = self.decoder.as_mut() {
-            if let Err(e) = d.seek(0.0) {
-                warn!("layer restart seek failed: {e}");
-            }
-            self.transport.position = 0.0;
-            self.transport.playing = true;
-            self.catchup = 0.0;
+        if self.worker.is_none() {
+            return;
         }
+        self.seek_internal(0.0);
+        self.transport.playing = true;
     }
 
     /// Seek the layer to `secs` (in source time) without changing the
-    /// playing/looping state. Used by the inspector's scrub bar.
+    /// playing/looping state. Used by the inspector's scrub bar and by
+    /// `restart`.
     ///
-    /// Decodes + uploads one frame **inline** so the seek is visible
-    /// even on paused layers — without this, a paused layer's texture
-    /// would keep showing the pre-seek frame because `tick` returns
-    /// early when `transport.playing` is false. Audio for the new
-    /// position is also queued into the ring buffer.
+    /// Bumps the seek epoch and dispatches a `Seek` command to the
+    /// worker; pre-seek frames already in the channel are filtered out
+    /// of `tick` via the epoch tag. For *paused* layers we additionally
+    /// block briefly for the worker's first post-seek frame and upload
+    /// it inline — without this, scrubbing a paused layer wouldn't
+    /// update the visible texture (since `tick` short-circuits when
+    /// `transport.playing` is false). 50 ms is comfortably above a
+    /// worker round-trip but unnoticeable as a UI hitch.
     pub fn seek(&mut self, gpu: &GpuContext, secs: f64) {
-        let target = secs.max(0.0);
-        let Some(decoder) = self.decoder.as_mut() else {
-            return;
-        };
-        if let Err(e) = decoder.seek(target) {
-            warn!("layer seek failed: {e}");
+        if self.is_live {
+            // Live capture devices aren't seekable; ignore. UI gates
+            // this too (no scrub bar shown), but keyboard shortcut R
+            // still calls restart() → seek(0); we silently no-op.
             return;
         }
-        self.transport.position = target;
-        self.catchup = 0.0;
-
-        // FFmpeg seeks to the keyframe at or before the requested
-        // time, so the first frame back will have PTS <= target. We
-        // upload it anyway and let `transport.position` reflect what
-        // actually got decoded; the slider snaps to the keyframe on
-        // the next render. Acceptable visual behaviour for scrubbing.
-        match decoder.next_frame() {
-            Ok(Some(frame)) => {
-                self.transport.position = frame.pts;
-                self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
-            }
-            Ok(None) => {
-                // EOF immediately after seeking past the end of the
-                // stream; leave the previous frame in place.
-            }
-            Err(e) => warn!("post-seek decode failed: {e}"),
+        self.seek_internal(secs.max(0.0));
+        if !self.transport.playing {
+            self.upload_post_seek_inline(gpu);
         }
-        self.flush_audio_to_ring();
     }
 
-    /// Pump the decoder for `dt` seconds of wall-clock time. Uploads the
-    /// freshest decoded frame to the layer's `VideoTexture` and drains
-    /// any decoded audio into the ring buffer. Drops the catch-up to
-    /// zero on loop / EOF.
+    fn upload_post_seek_inline(&mut self, gpu: &GpuContext) {
+        let Some(rx) = self.frame_rx.as_ref() else {
+            return;
+        };
+        // Loop a few times so a stray pre-seek frame doesn't make us
+        // upload the wrong content.
+        for _ in 0..FRAME_CHANNEL_CAPACITY + 1 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(item) => {
+                    if item.epoch < self.seek_epoch {
+                        continue;
+                    }
+                    if let Some(frame) = item.frame {
+                        self.transport.position = frame.pts;
+                        self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
+                    }
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn seek_internal(&mut self, secs: f64) {
+        let Some(tx) = self.cmd_tx.as_ref() else {
+            return;
+        };
+        self.seek_epoch = self.seek_epoch.wrapping_add(1);
+        if tx
+            .send(DecoderCmd::Seek(secs, self.seek_epoch))
+            .is_err()
+        {
+            return;
+        }
+        self.transport.position = secs;
+        self.catchup = 0.0;
+        // Drain any in-flight pre-seek frames so they don't hang around
+        // in the channel into the next tick. Worker may push more
+        // pre-seek frames before observing the Seek command — those get
+        // filtered by the epoch tag on the next `tick`.
+        if let Some(rx) = self.frame_rx.as_ref() {
+            while rx.try_recv().is_ok() {}
+        }
+    }
+
+    /// Pump the decoder for `dt` seconds of wall-clock time. Pops as
+    /// many frames as needed from the worker's channel, uploads the
+    /// freshest one to the layer's `VideoTexture`, and drops the
+    /// catch-up to zero on loop / EOF.
+    ///
+    /// Audio drain is owned by the worker now (it has the producer);
+    /// `tick` no longer touches the audio path.
     pub fn tick(&mut self, gpu: &GpuContext, dt: f64) {
-        if self.decoder.is_none() {
+        if self.worker.is_none() {
             return;
         }
         if !self.transport.playing {
-            // Even when paused on a video boundary we drain decoded
-            // audio that was buffered, so the sample queue doesn't
-            // grow indefinitely.
-            self.flush_audio_to_ring();
+            // Backpressure handles the pause: with main not draining,
+            // the bounded channel fills, the worker blocks on `send`,
+            // and no more decode work runs.
             return;
         }
         let period = self.frame_period / self.transport.speed.max(1e-3);
         self.catchup += dt;
-        loop {
-            // Always drain audio first; the video pump below may also
-            // demux fresh audio packets, which we'll drain on the next
-            // iteration.
-            self.flush_audio_to_ring();
 
+        let Some(rx) = self.frame_rx.as_ref() else {
+            return;
+        };
+
+        loop {
             if self.catchup < period {
                 break;
             }
-            self.catchup -= period;
-            let decoder = self.decoder.as_mut().expect("checked above");
-            match decoder.next_frame() {
-                Ok(Some(frame)) => {
-                    self.transport.position = frame.pts;
-                    self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
-                }
-                Ok(None) => {
-                    if self.transport.looping {
-                        if let Err(e) = decoder.seek(0.0) {
-                            warn!("layer loop-seek failed: {e}");
-                            self.transport.playing = false;
-                        }
-                        self.transport.position = 0.0;
-                    } else {
-                        self.transport.playing = false;
+            match rx.try_recv() {
+                Ok(item) => {
+                    if item.epoch < self.seek_epoch {
+                        // Pre-seek leftover; skip without consuming budget.
+                        continue;
                     }
-                    self.catchup = 0.0;
+                    match item.frame {
+                        Some(frame) => {
+                            self.transport.position = frame.pts;
+                            self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
+                            self.catchup -= period;
+                        }
+                        None => {
+                            // EOF marker. Same shape as the old `Ok(None)`.
+                            if self.transport.looping {
+                                // Looping is handled by the worker (it
+                                // reads the atomic on EOF and seeks(0)
+                                // itself). If we still got an EOF marker
+                                // here, looping must have flipped off
+                                // between worker's check and main's read.
+                                self.transport.position = 0.0;
+                                // Wake the worker by issuing a Seek(0).
+                                self.seek_internal(0.0);
+                            } else {
+                                self.transport.playing = false;
+                            }
+                            self.catchup = 0.0;
+                            break;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Worker hasn't produced the next frame yet; we'll
+                    // try again next tick. Don't burn the catchup —
+                    // dropping a frame here would only make the layer
+                    // visibly stutter the next time decode catches up.
                     break;
                 }
-                Err(e) => {
-                    error!("layer decode error: {e}");
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Worker exited unexpectedly; stop accepting input.
                     self.transport.playing = false;
                     self.catchup = 0.0;
                     break;
                 }
             }
-        }
-        // One last drain so any audio demuxed alongside the most
-        // recent video frame goes into the ring buffer this tick.
-        self.flush_audio_to_ring();
-    }
-
-    /// Move whatever audio the decoder has buffered into the ring
-    /// buffer. We aim to keep the ring buffer at least
-    /// `AUDIO_PUMP_TARGET_FILL` of its capacity. Anything beyond what
-    /// the buffer can hold stays inside the decoder's internal queue
-    /// and is drained on the next tick.
-    fn flush_audio_to_ring(&mut self) {
-        let Some(audio) = self.audio.as_mut() else {
-            return;
-        };
-        let Some(decoder) = self.decoder.as_mut() else {
-            return;
-        };
-        if decoder.audio_config().is_none() {
-            return;
-        }
-        let _target = (audio.producer.capacity().get() as f32 * AUDIO_PUMP_TARGET_FILL) as usize;
-        let free = audio.free_samples();
-        if free == 0 {
-            return;
-        }
-        if self.audio_scratch.len() < free {
-            self.audio_scratch.resize(free, 0.0);
-        }
-        let scratch = &mut self.audio_scratch[..free];
-        let n = decoder.take_audio_into(scratch);
-        if n > 0 {
-            audio.push(&scratch[..n]);
         }
     }
 
@@ -425,6 +580,15 @@ impl Layer {
         rpass.set_bind_group(0, bg, &[]);
         rpass.set_vertex_buffer(0, pipelines.vertex_buffer.slice(..));
         rpass.draw(0..6, 0..1);
+    }
+}
+
+impl Drop for Layer {
+    fn drop(&mut self) {
+        // Make sure the worker exits even if the Layer was just dropped
+        // (e.g. composition shrink). Best-effort: the worker may have
+        // already exited on its own.
+        self.stop_worker();
     }
 }
 

@@ -55,6 +55,27 @@ pub struct Decoder {
     info: StreamInfo,
 }
 
+// SAFETY: A `Decoder` owns FFmpeg state through raw pointers
+// (`SwsContext`, `SwrContext`, `AVFormatContext`, `AVCodecContext`).
+// FFmpeg itself is not safe to share across threads concurrently — but
+// it *is* safe to move ownership of these contexts to another thread
+// and use them exclusively from there. Our worker model does exactly
+// that: a `Decoder` is created on the main thread and either used there
+// (synchronous first-frame decode in `Layer::load`) or moved exactly
+// once into a dedicated decode worker thread, where it stays for the
+// lifetime of the clip. We never share a `Decoder` across threads.
+unsafe impl Send for Decoder {}
+
+// Compile-time guard: the threaded-decode pipeline relies on `Decoder:
+// Send`. If a future field addition silently breaks that, the worker
+// spawn site in `crates/app/src/decode_worker.rs` will fail with a
+// confusing `*mut … cannot be sent between threads` error. Catch it
+// here at the source instead.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Decoder>();
+};
+
 struct AudioPipeline {
     stream: usize,
     decoder: ffmpeg::decoder::Audio,
@@ -91,15 +112,63 @@ impl Decoder {
         Self::open_with_options(path, None, Some(audio))
     }
 
+    /// Open a decoder over a live capture device (USB cam etc.).
+    ///
+    /// `format_name` is the FFmpeg input-format identifier for the
+    /// host platform (`"avfoundation"` on macOS, `"v4l2"` on Linux,
+    /// `"dshow"` on Windows). `device` is the format-specific URL
+    /// FFmpeg wants — the index `"0:0"` for avfoundation, the path
+    /// `"/dev/video0"` for v4l2, etc.
+    ///
+    /// Pass an `audio` config to also demux the camera's microphone
+    /// into the per-decoder pending-audio buffer (resampled to the
+    /// engine's f32 stereo target). Pass `None` for video-only.
+    pub fn open_camera(
+        format_name: &str,
+        device: &str,
+        audio: Option<AudioConfig>,
+    ) -> Result<Self, AvError> {
+        ffmpeg::init().map_err(AvError::ffmpeg)?;
+        ffmpeg::device::register_all();
+
+        // Per-format defaults. avfoundation needs:
+        //
+        // - **framerate=30**: FFmpeg picks 29.97 by default, which
+        //   most cameras (FaceTime HD, iPhone Continuity Camera, …)
+        //   reject because they only enumerate whole-number rates
+        //   like 15 / 30 / 60. 30 is a safe pick across modern hardware.
+        //
+        // - **video_size=1280x720**: without this, AVFoundation hands
+        //   back the camera's "first" supported format, which on
+        //   modern Macs is often a square Center-Stage / Desk View
+        //   mode (e.g. 1552×1552 on the M-series FaceTime HD). 720p
+        //   16:9 is supported by every webcam shipped this decade
+        //   and gives the user a standard aspect ratio out of the
+        //   box. Per-camera resolution selection is a follow-up.
+        let options: &[(&str, &str)] = match format_name {
+            "avfoundation" => &[("framerate", "30"), ("video_size", "1280x720")],
+            _ => &[],
+        };
+
+        let input = unsafe { open_camera_input(format_name, device, options)? };
+        Self::from_input(input, None, audio)
+    }
+
     fn open_with_options<P: AsRef<Path>>(
         path: P,
         target_size: Option<(u32, u32)>,
         audio: Option<AudioConfig>,
     ) -> Result<Self, AvError> {
         ffmpeg::init().map_err(AvError::ffmpeg)?;
-
         let input = ffmpeg::format::input(&path).map_err(AvError::ffmpeg)?;
+        Self::from_input(input, target_size, audio)
+    }
 
+    fn from_input(
+        input: ffmpeg::format::context::Input,
+        target_size: Option<(u32, u32)>,
+        audio: Option<AudioConfig>,
+    ) -> Result<Self, AvError> {
         // Video.
         let v_stream = input
             .streams()
@@ -405,5 +474,77 @@ fn rational_as_f64(r: ffmpeg::Rational) -> f64 {
     } else {
         r.numerator() as f64 / den as f64
     }
+}
+
+/// Open an `Input` over an FFmpeg device (camera). Wraps the C-level
+/// `avformat_open_input` so we can pass a forced `AVInputFormat*`,
+/// which the safe `format::input(path)` helper doesn't expose.
+///
+/// SAFETY: We hand the resulting `*mut AVFormatContext` to
+/// `format::context::Input::wrap`, which assumes ownership and frees
+/// it on drop. Errors before that hand-off free the partial context
+/// via `avformat_close_input`.
+unsafe fn open_camera_input(
+    format_name: &str,
+    device: &str,
+    options: &[(&str, &str)],
+) -> Result<ffmpeg::format::context::Input, AvError> {
+    use std::ffi::CString;
+    use ffmpeg::sys;
+
+    let fmt_cstr = CString::new(format_name)
+        .map_err(|e| AvError::decode(format!("invalid format name {format_name:?}: {e}")))?;
+    let url_cstr = CString::new(device)
+        .map_err(|e| AvError::decode(format!("invalid device URL {device:?}: {e}")))?;
+
+    let format = unsafe { sys::av_find_input_format(fmt_cstr.as_ptr()) };
+    if format.is_null() {
+        return Err(AvError::decode(format!(
+            "FFmpeg input format {format_name:?} not registered (avdevice?)"
+        )));
+    }
+
+    // Build the options dictionary — avformat_open_input consumes it.
+    // Keep cstrings alive until after the call so their pointers
+    // remain valid.
+    let opt_pairs: Vec<(CString, CString)> = options
+        .iter()
+        .map(|(k, v)| {
+            (
+                CString::new(*k).expect("static option key"),
+                CString::new(*v).expect("static option value"),
+            )
+        })
+        .collect();
+    let mut dict: *mut sys::AVDictionary = std::ptr::null_mut();
+    for (k, v) in &opt_pairs {
+        unsafe { sys::av_dict_set(&mut dict, k.as_ptr(), v.as_ptr(), 0) };
+    }
+
+    let mut ctx: *mut sys::AVFormatContext = std::ptr::null_mut();
+    let ret = unsafe {
+        sys::avformat_open_input(
+            &mut ctx,
+            url_cstr.as_ptr(),
+            // av_find_input_format returns *const; avformat_open_input
+            // takes *const in current ffmpeg headers but the binding
+            // sometimes lists it as *mut — cast to be portable.
+            format as *mut _,
+            &mut dict,
+        )
+    };
+    // avformat_open_input strips recognised options from `dict` and
+    // leaves any unrecognised ones for the caller to inspect. We
+    // don't care which were eaten — just free the dictionary.
+    unsafe { sys::av_dict_free(&mut dict) };
+    if ret < 0 {
+        return Err(AvError::ffmpeg(ffmpeg::Error::from(ret)));
+    }
+    let ret = unsafe { sys::avformat_find_stream_info(ctx, std::ptr::null_mut()) };
+    if ret < 0 {
+        unsafe { sys::avformat_close_input(&mut ctx) };
+        return Err(AvError::ffmpeg(ffmpeg::Error::from(ret)));
+    }
+    Ok(unsafe { ffmpeg::format::context::Input::wrap(ctx) })
 }
 

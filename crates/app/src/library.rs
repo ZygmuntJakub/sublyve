@@ -8,6 +8,9 @@ use avengine_core::BlendMode;
 /// blend mode). Live edits in the right-hand layer inspector still take
 /// precedence until the next trigger; the defaults are what the clip
 /// "wants" by default.
+///
+/// For *camera* cells `looping` and `speed` are silently ignored at
+/// trigger time (live streams aren't seekable) — only `blend` is honoured.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClipDefaults {
     pub looping: bool,
@@ -21,15 +24,47 @@ impl Default for ClipDefaults {
     }
 }
 
-/// One clip slot in the grid: the file on disk, a display name, an
-/// optional GPU thumbnail, and per-clip default settings.
+/// What a library cell points at.
+///
+/// `File` is the original behaviour: a path to a video file on disk.
+/// `Camera` is a live capture device — `format_name` is FFmpeg's input
+/// format (`"avfoundation"` / `"v4l2"` / `"dshow"`), `device` is the
+/// device-specific URL we hand to `avformat_open_input`,
+/// `display_name` is the human-readable label we show in the UI and
+/// match against on project reload, and `has_audio` records whether
+/// enumeration paired the camera with a microphone — the trigger
+/// path uses this to skip the audio-open attempt entirely on
+/// video-only cameras (which would otherwise log a benign "no audio
+/// stream" warning every time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellSource {
+    File { path: PathBuf },
+    Camera {
+        format_name: String,
+        device: String,
+        display_name: String,
+        has_audio: bool,
+    },
+}
+
+impl CellSource {
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Camera { .. })
+    }
+}
+
+/// One clip slot in the grid: the source (file path or camera device),
+/// a display name, an optional GPU thumbnail, and per-clip default
+/// settings.
 ///
 /// The thumbnail is owned by the slot. The corresponding `egui::TextureId`
 /// (registered with `egui_wgpu::Renderer`) is tracked separately in the
 /// `AppState` because egui registration is the app's responsibility — the
-/// compositor crate stays egui-free.
+/// compositor crate stays egui-free. Camera cells don't decode a
+/// thumbnail (would require opening the device); they render a glyph +
+/// `name` instead.
 pub struct ClipSlot {
-    pub path: PathBuf,
+    pub source: CellSource,
     pub name: String,
     pub thumbnail: Option<Thumbnail>,
     pub thumbnail_id: Option<egui::TextureId>,
@@ -44,8 +79,28 @@ impl ClipSlot {
             .map(str::to_owned)
             .unwrap_or_else(|| path.display().to_string());
         Self {
-            path,
+            source: CellSource::File { path },
             name,
+            thumbnail: None,
+            thumbnail_id: None,
+            defaults: ClipDefaults::default(),
+        }
+    }
+
+    pub fn from_camera(
+        format_name: String,
+        device: String,
+        display_name: String,
+        has_audio: bool,
+    ) -> Self {
+        Self {
+            source: CellSource::Camera {
+                format_name,
+                device,
+                display_name: display_name.clone(),
+                has_audio,
+            },
+            name: display_name,
             thumbnail: None,
             thumbnail_id: None,
             defaults: ClipDefaults::default(),

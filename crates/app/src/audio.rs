@@ -5,8 +5,13 @@ use anyhow::{Context, Result, anyhow};
 use avengine_playback::AudioConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use ringbuf::traits::{Consumer, Split};
 use tracing::{info, warn};
+
+/// Producer side of the per-layer SPSC ring buffer. Exposed so the
+/// decode worker thread can own one directly and push samples without
+/// crossing back through the main thread.
+pub type AudioLayerProducer = ringbuf::HeapProd<f32>;
 
 /// Engine-internal sample format. Most macOS / Windows / Linux output
 /// devices natively support 48 kHz stereo f32, so we pin those values
@@ -68,24 +73,30 @@ impl AudioLayerControl {
     }
 }
 
-/// Producer-side handle the main thread (`Layer`) uses to push decoded
-/// samples and adjust playback parameters. Consumer side lives in the
-/// cpal callback.
+/// Producer-side handle for one layer. Holds the cpal-callback's view
+/// of the layer (the `control` Arc with gain/master/mute atomics) and
+/// the SPSC producer end of the ring buffer.
+///
+/// The producer is `Option` because once a clip is loaded the layer
+/// hands the producer to its decode worker thread (via `take_producer`)
+/// and reclaims it when the worker exits (via `set_producer`). While
+/// the worker owns it, the field is `None`.
 pub struct AudioLayerHandle {
     pub control: Arc<AudioLayerControl>,
-    pub producer: ringbuf::HeapProd<f32>,
+    pub producer: Option<AudioLayerProducer>,
 }
 
 impl AudioLayerHandle {
-    /// Push as many samples from `src` as the ring buffer can hold;
-    /// anything that doesn't fit is dropped (audio thread couldn't
-    /// drain fast enough — usually means the layer was paused).
-    pub fn push(&mut self, src: &[f32]) -> usize {
-        self.producer.push_slice(src)
+    /// Move the producer out so a decode worker can own it. Leaves the
+    /// handle's producer slot empty until the worker returns it on exit.
+    pub fn take_producer(&mut self) -> Option<AudioLayerProducer> {
+        self.producer.take()
     }
 
-    pub fn free_samples(&self) -> usize {
-        self.producer.vacant_len()
+    /// Park a producer back on the handle (called when a worker thread
+    /// joins so the next clip load can hand it to a new worker).
+    pub fn set_producer(&mut self, prod: AudioLayerProducer) {
+        self.producer = Some(prod);
     }
 }
 
@@ -126,7 +137,7 @@ impl AudioEngine {
             let (producer, consumer) = rb.split();
             let control = Arc::new(AudioLayerControl::default());
             sources.push(MixSource { control: control.clone(), consumer });
-            handles.push(AudioLayerHandle { control, producer });
+            handles.push(AudioLayerHandle { control, producer: Some(producer) });
         }
 
         let engine = Self {
@@ -215,7 +226,7 @@ impl AudioEngine {
                 control: control.clone(),
                 consumer,
             });
-            layer.replace_audio_handle(AudioLayerHandle { control, producer });
+            layer.replace_audio_handle(AudioLayerHandle { control, producer: Some(producer) });
         }
 
         self.build_stream(device_name, sources)
