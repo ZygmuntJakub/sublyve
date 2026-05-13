@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use avengine_playback::AudioConfig;
@@ -43,7 +44,28 @@ pub struct AudioLayerControl {
     /// pulling samples — pausing freezes both audio and video together.
     /// Muting still drains the ring (so the counter advances), which is
     /// what keeps the video moving while the audio is silenced.
+    ///
+    /// Note: `consumed_samples` counts frames *popped from the ring* —
+    /// not frames *audible at the DAC*. The samples we pop in a given
+    /// callback won't reach the speakers until ~`lead_nanos` later, so
+    /// using this counter on its own makes the picture lead the sound
+    /// by the playout lead time (typically 10–80 ms). The Layer pairs
+    /// it with `lead_nanos` to correct for that static offset.
     pub consumed_samples: AtomicU64,
+    /// Predicted playout lead time (`playback - callback`, from cpal's
+    /// `OutputStreamTimestamp`) measured at the most recent callback,
+    /// in nanoseconds. The samples just popped will be audible
+    /// approximately this far in the future. The Layer subtracts
+    /// `lead_nanos * sample_rate / 1e9` from `consumed_samples` to get
+    /// the *audible* sample count — the actual PTS of what the user is
+    /// hearing right now.
+    ///
+    /// Updated together with `consumed_samples` in the cpal callback;
+    /// readers may see a stale pair (one updated, the other not) but
+    /// the inconsistency is bounded by one callback's worth of samples
+    /// and is dwarfed by the natural buffer jitter, so we tolerate it
+    /// without seqlock-style ceremony.
+    pub lead_nanos: AtomicU64,
 }
 
 impl Default for AudioLayerControl {
@@ -53,6 +75,7 @@ impl Default for AudioLayerControl {
             master_bits: AtomicU32::new(1.0_f32.to_bits()),
             muted: AtomicBool::new(false),
             consumed_samples: AtomicU64::new(0),
+            lead_nanos: AtomicU64::new(0),
         }
     }
 }
@@ -82,8 +105,38 @@ impl AudioLayerControl {
         self.muted.load(Ordering::Relaxed)
     }
 
+    /// Raw popped-from-ring counter. Use `audible_samples` for sync;
+    /// this is exposed for telemetry / debugging only.
+    #[allow(dead_code)]
     pub fn consumed_samples(&self) -> u64 {
         self.consumed_samples.load(Ordering::Relaxed)
+    }
+
+    /// Latest cpal-reported playout lead time, in nanoseconds. Exposed
+    /// for telemetry / debugging; `audible_samples` already folds this
+    /// in for the sync path.
+    #[allow(dead_code)]
+    pub fn lead_nanos(&self) -> u64 {
+        self.lead_nanos.load(Ordering::Relaxed)
+    }
+
+    /// "Audible samples" — frames the DAC has actually played, derived
+    /// from `consumed_samples` minus the predicted playout lead time.
+    /// This is the value the video pump should target.
+    ///
+    /// Saturating at zero handles the first few callbacks where the
+    /// ring buffer hasn't drained enough samples to cover the lead
+    /// time yet (e.g. on first play, `consumed_samples` may be 2048
+    /// but `lead_samples` may be 5760 — picture should sit at PTS 0,
+    /// not jump backwards).
+    pub fn audible_samples(&self, sample_rate: u32) -> u64 {
+        let consumed = self.consumed_samples.load(Ordering::Relaxed);
+        let lead = self.lead_nanos.load(Ordering::Relaxed);
+        // lead_samples = lead_nanos * sample_rate / 1e9, computed with
+        // u128 to keep the multiply from wrapping at unusual rates.
+        let lead_samples =
+            ((lead as u128).saturating_mul(sample_rate as u128) / 1_000_000_000u128) as u64;
+        consumed.saturating_sub(lead_samples)
     }
 }
 
@@ -233,6 +286,13 @@ impl AudioEngine {
         for layer in layers.iter_mut() {
             let rb = HeapRb::<f32>::new(LAYER_BUFFER_CAPACITY);
             let (producer, consumer) = rb.split();
+            // LOAD-BEARING: reuse the layer's existing `AudioLayerControl`
+            // Arc so the `consumed_samples` / `lead_nanos` counters that
+            // anchor A/V sync survive the device swap. Allocating a
+            // fresh control here would reset both counters to zero,
+            // making `Layer::audio_target_pts` race forward by the
+            // pre-swap consumed count and producing a one-off picture
+            // jump every time the user switches devices.
             let control = layer
                 .audio_control()
                 .unwrap_or_else(|| Arc::new(AudioLayerControl::default()));
@@ -280,8 +340,20 @@ impl AudioEngine {
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_output_stream(
                 &stream_config,
-                move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    mix(output, &mut mix_sources, &master, &mut scratch);
+                move |output: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    // cpal hands us a predicted-playback / callback pair
+                    // per buffer. The delta is the "lead time" — how far
+                    // in the future the samples we're about to pop will
+                    // be heard. We propagate it into each layer's
+                    // `lead_nanos` atomic so `Layer::tick` can subtract
+                    // it from `consumed_samples` and drive the video
+                    // pump off audible (not popped) audio time.
+                    let ts = info.timestamp();
+                    let lead = ts
+                        .playback
+                        .duration_since(&ts.callback)
+                        .unwrap_or(Duration::ZERO);
+                    mix(output, &mut mix_sources, &master, &mut scratch, lead);
                 },
                 err_handler,
                 None,
@@ -337,10 +409,21 @@ fn mix(
     sources: &mut [MixSource],
     master: &AtomicU32,
     scratch: &mut [f32],
+    lead: Duration,
 ) {
     output.fill(0.0);
     let channels = ENGINE_CHANNELS as usize;
+    // Capped at u64 to avoid platform-specific overflow on 32-bit
+    // `lead.as_nanos()` returns (it's `u128`); a sensible playout
+    // buffer is < 1 s, so this cap never trims real data.
+    let lead_nanos: u64 = lead.as_nanos().min(u64::MAX as u128) as u64;
     for src in sources.iter_mut() {
+        // Publish the lead time *before* we pop, so a reader that
+        // catches the inconsistency window sees a slightly-old
+        // consumed_samples with the *current* lead — biases the
+        // computed audible time backwards by at most one buffer, which
+        // is the right side to err on (no future-PTS uploads).
+        src.control.lead_nanos.store(lead_nanos, Ordering::Relaxed);
         if src.control.is_muted() {
             // Drain so the buffer doesn't backlog while muted. The
             // consumed-sample counter still advances on the drained

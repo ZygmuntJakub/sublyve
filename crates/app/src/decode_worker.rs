@@ -56,6 +56,14 @@ pub struct DecodedItem {
     pub frame: Option<VideoFrame>,
     /// Seek-epoch tag. Main thread drops items with `epoch < current`.
     pub epoch: u64,
+    /// Monotonic loop iteration counter. Incremented by the worker
+    /// each time it wraps from EOF back to PTS 0 (i.e. one increment
+    /// per playback of the clip when looping is on). The main thread
+    /// observes the change as a signal to re-anchor the audio clock —
+    /// more robust than detecting the backwards PTS jump with a magic
+    /// threshold, which would race the audio side and break on clips
+    /// shorter than the threshold.
+    pub loop_iteration: u64,
 }
 
 /// Spawn the worker thread. The returned `JoinHandle` resolves to the
@@ -82,6 +90,11 @@ fn worker_loop(
     mut audio_producer: Option<AudioLayerProducer>,
 ) -> Option<AudioLayerProducer> {
     let mut epoch: u64 = 0;
+    // Bumped each time we wrap from EOF back to PTS 0 in the looping
+    // branch below. Tagged onto every emitted frame so `Layer::tick`
+    // can spot the wrap exactly (without sniffing for backwards PTS
+    // jumps with a magic threshold that breaks on short clips).
+    let mut loop_iteration: u64 = 0;
     let mut audio_scratch: Vec<f32> = Vec::new();
 
     loop {
@@ -109,7 +122,11 @@ fn worker_loop(
                     drain_audio(&mut decoder, prod, &mut audio_scratch);
                 }
                 if frame_tx
-                    .send(DecodedItem { frame: Some(frame), epoch })
+                    .send(DecodedItem {
+                        frame: Some(frame),
+                        epoch,
+                        loop_iteration,
+                    })
                     .is_err()
                 {
                     return audio_producer;
@@ -121,11 +138,18 @@ fn worker_loop(
                         warn!("decode worker: loop-seek failed: {err}");
                         return audio_producer;
                     }
-                    // Same clip from the top — no epoch bump.
+                    // Same clip from the top — no epoch bump, but bump
+                    // the loop iteration so the main thread re-anchors
+                    // its audio clock to PTS 0 on the next frame.
+                    loop_iteration = loop_iteration.wrapping_add(1);
                 } else {
                     // Notify main once that the stream ended at this epoch.
                     if frame_tx
-                        .send(DecodedItem { frame: None, epoch })
+                        .send(DecodedItem {
+                            frame: None,
+                            epoch,
+                            loop_iteration,
+                        })
                         .is_err()
                     {
                         return audio_producer;
