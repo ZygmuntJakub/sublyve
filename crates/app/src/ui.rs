@@ -138,8 +138,6 @@ pub struct UiActions {
     pub set_bottom_tab: Option<BottomTab>,
     /// Right (settings) panel tab change from a manual header click.
     pub set_right_tab: Option<RightTab>,
-    /// Refresh the enumerated camera list (Camera tab "🔄" button).
-    pub refresh_cameras: bool,
     /// User dropped a Camera-tab payload onto a grid cell — bind the
     /// cell to that camera. Auto-triggers if the layer was empty.
     /// Tuple: `(row, col, format_name, device, display_name, has_audio)`.
@@ -779,21 +777,17 @@ fn clip_inspector_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiAc
 /// Camera tab in the bottom panel: list of enumerated capture devices,
 /// each row a drag source. Drop a row onto a grid cell to bind that
 /// cell to the camera.
-fn camera_inspector_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+fn camera_inspector_tab(ui: &mut egui::Ui, ctx: &UiContext<'_>, _actions: &mut UiActions) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| camera_inspector_body(ui, ctx, actions));
+        .show(ui, |ui| camera_inspector_body(ui, ctx));
 }
 
-fn camera_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
-    ui.horizontal(|ui| {
-        ui.heading("Cameras");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("🔄  Refresh").clicked() {
-                actions.refresh_cameras = true;
-            }
-        });
-    });
+/// Render the Camera tab body. We pull `cameras` from `ctx` and only
+/// emit egui drag-and-drop payloads — no actions are written, so we
+/// don't take a `UiActions`.
+fn camera_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>) {
+    ui.heading("Cameras");
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new("Drag a camera onto a grid cell to bind it.")
@@ -805,7 +799,7 @@ fn camera_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut U
     if ctx.cameras.is_empty() {
         ui.label(
             egui::RichText::new(
-                "No cameras detected. Plug one in and click Refresh.",
+                "No cameras detected. Plug one in — the list updates automatically.",
             )
             .weak(),
         );
