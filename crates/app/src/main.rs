@@ -5,6 +5,7 @@ mod decode_worker;
 mod layer;
 mod library;
 mod project;
+mod thumb_cache;
 mod thumbs;
 mod ui;
 
@@ -646,7 +647,7 @@ impl AppState {
     fn import_clip(&mut self, path: PathBuf, row: usize, col: usize) -> Result<()> {
         let mut slot = ClipSlot::from_path(path.clone());
 
-        match thumbs::extract_thumbnail(&path, thumbs::DEFAULT_W, thumbs::DEFAULT_H) {
+        match thumb_cache::load_or_decode(&path, thumbs::DEFAULT_W, thumbs::DEFAULT_H) {
             Ok(frame) => {
                 let thumb = Thumbnail::from_frame(&self.gpu.device, &self.gpu.queue, &frame);
                 let id = self.control.egui_renderer.register_native_texture(
