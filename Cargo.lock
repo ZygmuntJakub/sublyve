@@ -234,6 +234,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "cpal",
+ "crc32fast",
  "dirs",
  "egui",
  "egui-wgpu",
