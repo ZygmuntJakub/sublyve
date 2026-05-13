@@ -1,4 +1,5 @@
 mod audio;
+mod bundle;
 mod composition;
 mod config;
 mod decode_worker;
@@ -499,7 +500,7 @@ impl AppState {
         };
 
         if let Some(path) = project_to_load {
-            match project::load_from_path(&path) {
+            match load_project_any(&path) {
                 Ok(project) => {
                     if let Err(e) = state.apply_project(project) {
                         warn!("failed to apply project from {}: {e:#}", path.display());
@@ -1416,11 +1417,15 @@ impl AppState {
     fn save_project_as_dialog(&mut self) -> Result<()> {
         // Default the save dialog to the directory of whatever project
         // is currently loaded, so re-saving puts the file next to its
-        // siblings instead of in `~`.
+        // siblings instead of in `~`. `.sublyve` is the preferred
+        // bundle format (zip including clip files); `.sublyve.json` is
+        // the legacy loose JSON that just references absolute paths on
+        // disk.
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save Sublyve project")
-            .add_filter("Sublyve project", &["sublyve.json", "json"])
-            .set_file_name("project.sublyve.json");
+            .add_filter("Sublyve bundle", &["sublyve"])
+            .add_filter("Sublyve project (JSON only)", &["sublyve.json", "json"])
+            .set_file_name("project.sublyve");
         if let Some(parent) = self
             .current_project_path
             .as_ref()
@@ -1431,7 +1436,11 @@ impl AppState {
         }
         let Some(path) = dialog.save_file() else { return Ok(()) };
         let project = self.capture_project();
-        project::save_atomic(&project, &path)?;
+        if bundle::is_bundle_path(&path) {
+            bundle::save_to_path(&project, &path)?;
+        } else {
+            project::save_atomic(&project, &path)?;
+        }
         info!("project saved → {}", path.display());
         self.config.remember_project(&path);
         self.current_project_path = Some(path);
@@ -1441,7 +1450,7 @@ impl AppState {
     fn open_project_dialog(&mut self) -> Result<()> {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Open Sublyve project")
-            .add_filter("Sublyve project", &["sublyve.json", "json"])
+            .add_filter("Sublyve project", &["sublyve", "sublyve.json", "json"])
             .add_filter("All files", &["*"]);
         if let Some(parent) = self
             .current_project_path
@@ -1456,16 +1465,18 @@ impl AppState {
     }
 
     /// Shared body for "Open Recent ▸ X" and the open dialog: load
-    /// the project, apply it, and record it as the current path.
+    /// the project (or bundle), apply it, and record it as the
+    /// current path.
     ///
-    /// On a `load_from_path` failure (file gone / parse error) we
-    /// proactively forget the path so a stale Recent entry stops
-    /// reappearing. On `apply_project` failures we deliberately do
-    /// *not* — those are likely transient (a future fallible
-    /// rebuild step, GPU hiccup, …) and yanking the recent entry
-    /// would punish the user for a problem they didn't cause.
+    /// On a `load_project_any` failure (file gone / parse error /
+    /// bundle corrupt) we proactively forget the path so a stale
+    /// Recent entry stops reappearing. On `apply_project` failures
+    /// we deliberately do *not* — those are likely transient
+    /// (a future fallible rebuild step, GPU hiccup, …) and yanking
+    /// the recent entry would punish the user for a problem they
+    /// didn't cause.
     fn load_project_from_path(&mut self, path: &Path) -> Result<()> {
-        let project = match project::load_from_path(path) {
+        let project = match load_project_any(path) {
             Ok(p) => p,
             Err(e) => {
                 self.config.forget_project(path);
@@ -1869,6 +1880,17 @@ impl AppState {
                 master_volume: self.audio_engine.master_volume(),
             },
         }
+    }
+}
+
+/// Load a project from either a `.sublyve` bundle (zip) or a loose
+/// `.sublyve.json`, picking the path based on file extension. Bundles
+/// extract into a per-bundle cache dir on first load.
+fn load_project_any(path: &Path) -> Result<project::Project> {
+    if bundle::is_bundle_path(path) {
+        bundle::load_from_path(path)
+    } else {
+        project::load_from_path(path)
     }
 }
 

@@ -218,6 +218,18 @@ pub fn load_from_path(path: &Path) -> Result<Project> {
     Ok(file.project)
 }
 
+/// Serialize `project` to pretty JSON wrapped in the versioned envelope.
+/// Used both for plain `.sublyve.json` writes (via [`save_atomic`]) and
+/// for the project entry inside a `.sublyve` bundle (see
+/// `bundle::save_to_path`).
+pub fn to_versioned_json(project: &Project) -> Result<String> {
+    let file = ProjectFile {
+        version: CURRENT_VERSION,
+        project: project.clone(),
+    };
+    serde_json::to_string_pretty(&file).context("serializing project")
+}
+
 /// Save `project` to `path` durably:
 ///
 /// 1. Serialize and write to a sibling temp file `<name>.tmp.<pid>`.
@@ -247,7 +259,8 @@ pub fn save_atomic(project: &Project, path: &Path) -> Result<()> {
     use std::fs::{File, OpenOptions};
     use std::io::Write;
 
-    let json = serialize(project, path)?;
+    let json = to_versioned_json(project)
+        .with_context(|| format!("serializing project for {}", path.display()))?;
 
     let Some(name) = path.file_name() else {
         // Degenerate path with no file name (e.g. `/`). Fall back to a
@@ -303,18 +316,6 @@ pub fn save_atomic(project: &Project, path: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Serialize a `Project` to pretty JSON, wrapped in `ProjectFile` so
-/// the on-disk shape carries a version tag. Errors are contextualised
-/// with the target path so log lines tell you which save failed.
-fn serialize(project: &Project, path: &Path) -> Result<String> {
-    let file = ProjectFile {
-        version: CURRENT_VERSION,
-        project: project.clone(),
-    };
-    serde_json::to_string_pretty(&file)
-        .with_context(|| format!("serializing project for {}", path.display()))
 }
 
 /// Walk a `Library` and emit a `CellSpec` for every occupied cell.
