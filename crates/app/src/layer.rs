@@ -11,7 +11,7 @@ use avengine_core::BlendMode;
 use avengine_playback::{AudioConfig, Decoder, StreamInfo, Transport};
 use wgpu::util::DeviceExt;
 
-use crate::audio::{AudioLayerHandle, AudioLayerProducer};
+use crate::audio::{AudioLayerControl, AudioLayerHandle, AudioLayerProducer};
 use crate::decode_worker::{self, DecodedItem, DecoderCmd, FRAME_CHANNEL_CAPACITY};
 use crate::library::ClipDefaults;
 
@@ -44,8 +44,21 @@ pub struct Layer {
 
     frame_period: f64,
     /// Per-layer wall-clock catch-up accumulator. Bounded by the global
-    /// `MAX_CATCHUP_SECS` clamp applied in `tick`.
+    /// `MAX_CATCHUP_SECS` clamp applied in `tick`. Only used when the
+    /// layer has no audio stream (video-only clips, cameras without a
+    /// mic, the silent preview deck); audio-bearing layers run off the
+    /// audio clock and ignore this.
     catchup: f64,
+    /// Audio-clock anchor for the currently-loaded source. `Some` iff
+    /// the active clip publishes audio frames through the cpal callback;
+    /// `None` for video-only sources, which fall back to the wall-clock
+    /// pump. The pair is `(consumed_samples_at_anchor, source_pts_at_anchor)`:
+    /// target playhead each tick is `pts + (consumed_now - consumed) / sample_rate`.
+    /// Re-anchored on load, on seek, and on resume from pause.
+    audio_clock: Option<AudioClock>,
+    /// Last observed value of `transport.playing` — drives the re-anchor
+    /// on resume so the audio clock and video PTS start in lockstep.
+    was_playing: bool,
 
     pub video_texture: VideoTexture,
     /// Generation of `video_texture` the bind group was built for.
@@ -76,6 +89,15 @@ pub struct Layer {
     /// Looping flag shared with the worker — read on EOF to decide
     /// loop vs. stop. Cheaper than a command for a per-toggle flag.
     looping_atomic: Arc<AtomicBool>,
+}
+
+/// Anchor for converting the cpal callback's consumed-sample count into
+/// source playhead seconds. See `Layer::audio_clock` for the equation.
+struct AudioClock {
+    control: Arc<AudioLayerControl>,
+    sample_rate: u32,
+    anchor_consumed: u64,
+    anchor_pts: f64,
 }
 
 impl Layer {
@@ -122,6 +144,8 @@ impl Layer {
             info: None,
             frame_period: 1.0 / 30.0,
             catchup: 0.0,
+            audio_clock: None,
+            was_playing: false,
             video_texture,
             bound_video_gen: u64::MAX,
             bind_group: None,
@@ -245,6 +269,8 @@ impl Layer {
             self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
         }
         self.info = Some(info);
+        self.was_playing = self.transport.playing;
+        self.audio_clock = self.build_audio_clock(info.has_audio);
 
         // Hand the audio producer (if any) to the worker.
         let audio_producer = self.audio.as_mut().and_then(|a| a.take_producer());
@@ -307,6 +333,8 @@ impl Layer {
             self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
         }
         self.info = Some(info);
+        self.was_playing = self.transport.playing;
+        self.audio_clock = self.build_audio_clock(info.has_audio);
 
         let audio_producer = self.audio.as_mut().and_then(|a| a.take_producer());
         let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedItem>(FRAME_CHANNEL_CAPACITY);
@@ -323,6 +351,29 @@ impl Layer {
         self.cmd_tx = Some(cmd_tx);
         self.worker = Some(worker);
         Ok(())
+    }
+
+    /// Snapshot the audio engine's per-layer consumed-sample counter at
+    /// the current `transport.position` and remember the engine sample
+    /// rate, so `tick` can convert future consumed-sample readings into
+    /// source-time deltas. Returns `None` if the source has no audio or
+    /// the layer isn't wired into the engine (preview deck) — those
+    /// cases fall through to the wall-clock pump.
+    fn build_audio_clock(&self, source_has_audio: bool) -> Option<AudioClock> {
+        if !source_has_audio {
+            return None;
+        }
+        let control = self.audio.as_ref()?.control.clone();
+        let sample_rate = self.audio_config?.sample_rate;
+        if sample_rate == 0 {
+            return None;
+        }
+        Some(AudioClock {
+            anchor_consumed: control.consumed_samples(),
+            anchor_pts: self.transport.position,
+            sample_rate,
+            control,
+        })
     }
 
     /// Stop the worker thread (if any) and reclaim the audio producer.
@@ -349,6 +400,8 @@ impl Layer {
         self.is_live = false;
         self.transport.playing = false;
         self.catchup = 0.0;
+        self.audio_clock = None;
+        self.was_playing = false;
         self.seek_epoch = 0;
         // Stale audio in the ring buffer would briefly play after the
         // next clip is loaded; we accept up to ~340 ms of glitching
@@ -434,6 +487,12 @@ impl Layer {
         }
         self.transport.position = secs;
         self.catchup = 0.0;
+        // Re-anchor the audio clock so post-seek deltas start from the
+        // new playhead. The cpal callback's consumed-sample counter is
+        // monotonic across the seek (the ring buffer still drains its
+        // pre-seek tail, which is fine: those samples advance the
+        // counter but the anchor we snapshot here absorbs them).
+        self.reanchor_audio_clock(secs);
         // Drain any in-flight pre-seek frames so they don't hang around
         // in the channel into the next tick. Worker may push more
         // pre-seek frames before observing the Seek command — those get
@@ -443,13 +502,27 @@ impl Layer {
         }
     }
 
-    /// Pump the decoder for `dt` seconds of wall-clock time. Pops as
-    /// many frames as needed from the worker's channel, uploads the
-    /// freshest one to the layer's `VideoTexture`, and drops the
-    /// catch-up to zero on loop / EOF.
+    fn reanchor_audio_clock(&mut self, pts: f64) {
+        if let Some(clock) = self.audio_clock.as_mut() {
+            clock.anchor_consumed = clock.control.consumed_samples();
+            clock.anchor_pts = pts;
+        }
+    }
+
+    /// Pump the decoder forward by one tick. Two pump modes:
     ///
-    /// Audio drain is owned by the worker now (it has the producer);
-    /// `tick` no longer touches the audio path.
+    /// - **Audio master** (`audio_clock.is_some()`): the target playhead
+    ///   is derived from the cpal callback's consumed-sample counter,
+    ///   so long clips can't drift between picture and sound. We pull
+    ///   frames until the next one would overshoot the audio target.
+    ///
+    /// - **Wall-clock fallback** (`audio_clock.is_none()`): video-only
+    ///   sources (cameras without a mic, the silent preview deck, files
+    ///   without an audio stream) accumulate `dt` into `catchup` and
+    ///   advance one decoded frame per `frame_period`.
+    ///
+    /// Audio drain is owned by the decode worker (it has the producer
+    /// end of the ring buffer); `tick` no longer touches the audio path.
     pub fn tick(&mut self, gpu: &GpuContext, dt: f64) {
         if self.worker.is_none() {
             return;
@@ -457,66 +530,142 @@ impl Layer {
         if !self.transport.playing {
             // Backpressure handles the pause: with main not draining,
             // the bounded channel fills, the worker blocks on `send`,
-            // and no more decode work runs.
+            // and no more decode work runs. Track the transition so
+            // we can re-anchor the audio clock on resume.
+            self.was_playing = false;
             return;
         }
-        let period = self.frame_period / self.transport.speed.max(1e-3);
-        self.catchup += dt;
+        if !self.was_playing {
+            // Just resumed from pause: the ring buffer drained while
+            // paused, advancing the consumed counter without the video
+            // moving. Snapping the anchor to the current playhead lets
+            // both clocks restart in lockstep.
+            self.reanchor_audio_clock(self.transport.position);
+            self.was_playing = true;
+        }
 
-        let Some(rx) = self.frame_rx.as_ref() else {
+        if self.audio_clock.is_some() {
+            self.tick_audio_master(gpu);
+        } else {
+            self.tick_wallclock(gpu, dt);
+        }
+    }
+
+    /// Audio-master pump: pull as many frames as needed so the most
+    /// recently uploaded PTS is at-or-ahead of the audio playhead, but
+    /// stop short of overshooting (don't pop a frame whose PTS is
+    /// further in the future than the audio clock has reached).
+    fn tick_audio_master(&mut self, gpu: &GpuContext) {
+        let Some(target) = self.audio_target_pts() else {
             return;
         };
-
-        loop {
-            if self.catchup < period {
-                break;
-            }
-            match rx.try_recv() {
-                Ok(item) => {
-                    if item.epoch < self.seek_epoch {
-                        // Pre-seek leftover; skip without consuming budget.
-                        continue;
-                    }
-                    match item.frame {
-                        Some(frame) => {
-                            self.transport.position = frame.pts;
-                            self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
-                            self.catchup -= period;
+        let mut hit_eof = false;
+        if let Some(rx) = self.frame_rx.as_ref() {
+            loop {
+                if self.transport.position >= target {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(item) => {
+                        if item.epoch < self.seek_epoch {
+                            continue;
                         }
-                        None => {
-                            // EOF marker. Same shape as the old `Ok(None)`.
-                            if self.transport.looping {
-                                // Looping is handled by the worker (it
-                                // reads the atomic on EOF and seeks(0)
-                                // itself). If we still got an EOF marker
-                                // here, looping must have flipped off
-                                // between worker's check and main's read.
-                                self.transport.position = 0.0;
-                                // Wake the worker by issuing a Seek(0).
-                                self.seek_internal(0.0);
-                            } else {
-                                self.transport.playing = false;
+                        match item.frame {
+                            Some(frame) => {
+                                // Worker loops back to PTS 0 on EOF when
+                                // looping is on; re-anchor when we
+                                // observe that backwards jump so the
+                                // audio target restarts from the new
+                                // origin instead of racing ahead by one
+                                // whole clip length.
+                                if frame.pts + 0.5 < self.transport.position
+                                    && let Some(clock) = self.audio_clock.as_mut()
+                                {
+                                    clock.anchor_consumed =
+                                        clock.control.consumed_samples();
+                                    clock.anchor_pts = frame.pts;
+                                }
+                                self.transport.position = frame.pts;
+                                self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
                             }
-                            self.catchup = 0.0;
-                            break;
+                            None => {
+                                hit_eof = true;
+                                break;
+                            }
                         }
                     }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Worker hasn't produced the next frame yet; we'll
-                    // try again next tick. Don't burn the catchup —
-                    // dropping a frame here would only make the layer
-                    // visibly stutter the next time decode catches up.
-                    break;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Worker exited unexpectedly; stop accepting input.
-                    self.transport.playing = false;
-                    self.catchup = 0.0;
-                    break;
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.transport.playing = false;
+                        break;
+                    }
                 }
             }
         }
+        if hit_eof {
+            self.handle_eof();
+        }
+    }
+
+    fn tick_wallclock(&mut self, gpu: &GpuContext, dt: f64) {
+        let period = self.frame_period / self.transport.speed.max(1e-3);
+        self.catchup += dt;
+        let mut hit_eof = false;
+        if let Some(rx) = self.frame_rx.as_ref() {
+            loop {
+                if self.catchup < period {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(item) => {
+                        if item.epoch < self.seek_epoch {
+                            continue;
+                        }
+                        match item.frame {
+                            Some(frame) => {
+                                self.transport.position = frame.pts;
+                                self.video_texture.upload(&gpu.device, &gpu.queue, &frame);
+                                self.catchup -= period;
+                            }
+                            None => {
+                                hit_eof = true;
+                                break;
+                            }
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.transport.playing = false;
+                        self.catchup = 0.0;
+                        break;
+                    }
+                }
+            }
+        }
+        if hit_eof {
+            self.handle_eof();
+        }
+    }
+
+    fn audio_target_pts(&self) -> Option<f64> {
+        let clock = self.audio_clock.as_ref()?;
+        let now = clock.control.consumed_samples();
+        let delta = now.saturating_sub(clock.anchor_consumed);
+        Some(clock.anchor_pts + (delta as f64) / (clock.sample_rate as f64))
+    }
+
+    fn handle_eof(&mut self) {
+        if self.transport.looping {
+            // Looping is handled by the worker (it reads the atomic on
+            // EOF and seeks(0) itself). If we still got an EOF marker
+            // here, looping must have flipped off between worker's
+            // check and main's read.
+            self.transport.position = 0.0;
+            self.seek_internal(0.0);
+        } else {
+            self.transport.playing = false;
+        }
+        self.catchup = 0.0;
     }
 
     /// Refresh the per-layer uniforms (opacity + composition-fit scale)

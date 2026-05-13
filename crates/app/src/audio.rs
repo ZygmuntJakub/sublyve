@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use avengine_playback::AudioConfig;
@@ -35,6 +35,15 @@ pub struct AudioLayerControl {
     /// and both buses go silent / black at once.
     pub master_bits: AtomicU32,
     pub muted: AtomicBool,
+    /// Per-layer audio frames (channel-frames, not interleaved samples)
+    /// the cpal callback has popped from this source's ring buffer.
+    /// Used by `Layer::tick` as the master clock when audio is present:
+    /// the video pump targets `(consumed - origin) / sample_rate` seconds
+    /// of source time. Counter advances only while cpal is actually
+    /// pulling samples — pausing freezes both audio and video together.
+    /// Muting still drains the ring (so the counter advances), which is
+    /// what keeps the video moving while the audio is silenced.
+    pub consumed_samples: AtomicU64,
 }
 
 impl Default for AudioLayerControl {
@@ -43,6 +52,7 @@ impl Default for AudioLayerControl {
             gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             master_bits: AtomicU32::new(1.0_f32.to_bits()),
             muted: AtomicBool::new(false),
+            consumed_samples: AtomicU64::new(0),
         }
     }
 }
@@ -70,6 +80,10 @@ impl AudioLayerControl {
 
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    pub fn consumed_samples(&self) -> u64 {
+        self.consumed_samples.load(Ordering::Relaxed)
     }
 }
 
@@ -325,19 +339,25 @@ fn mix(
     scratch: &mut [f32],
 ) {
     output.fill(0.0);
+    let channels = ENGINE_CHANNELS as usize;
     for src in sources.iter_mut() {
         if src.control.is_muted() {
-            // Drain so the buffer doesn't backlog while muted.
-            let _ = src.consumer.pop_slice(scratch);
+            // Drain so the buffer doesn't backlog while muted. The
+            // consumed-sample counter still advances on the drained
+            // samples, which is what keeps the video pump rolling
+            // while the audio is silenced.
+            let take = output.len().min(scratch.len());
+            let popped = src.consumer.pop_slice(&mut scratch[..take]);
+            advance_consumed(&src.control, popped, channels);
             continue;
         }
         let effective_gain = src.control.gain() * src.control.master();
-        if effective_gain == 0.0 {
-            let _ = src.consumer.pop_slice(scratch);
-            continue;
-        }
         let take = output.len().min(scratch.len());
         let popped = src.consumer.pop_slice(&mut scratch[..take]);
+        advance_consumed(&src.control, popped, channels);
+        if effective_gain == 0.0 {
+            continue;
+        }
         for i in 0..popped {
             output[i] += scratch[i] * effective_gain;
         }
@@ -345,5 +365,15 @@ fn mix(
     let master_g = f32::from_bits(master.load(Ordering::Relaxed));
     for s in output.iter_mut() {
         *s = (*s * master_g).clamp(-1.0, 1.0);
+    }
+}
+
+fn advance_consumed(control: &AudioLayerControl, popped_interleaved: usize, channels: usize) {
+    if popped_interleaved == 0 || channels == 0 {
+        return;
+    }
+    let frames = (popped_interleaved / channels) as u64;
+    if frames > 0 {
+        control.consumed_samples.fetch_add(frames, Ordering::Relaxed);
     }
 }
