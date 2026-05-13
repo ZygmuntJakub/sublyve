@@ -44,7 +44,6 @@
 //! of unique `(path, mtime, size)` triples the user has ever imported.
 
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -108,12 +107,20 @@ pub fn load_or_decode(path: &Path, width: u32, height: u32) -> Result<VideoFrame
     Ok(frame)
 }
 
-/// Stable cache key for a file: `(canonical path, mtime, size)` hashed via
-/// SipHash-1-3 with a fixed key.
+/// Stable cache key for a file: `(canonical path, mtime, size)` reduced to a
+/// `u64` via FNV-1a.
 ///
-/// `DefaultHasher::new()` uses a fixed key (not the per-process randomised
-/// key that `RandomState` would give us), so the result is reproducible
-/// across launches — which is exactly what a disk cache needs.
+/// We deliberately do *not* use `std::collections::hash_map::DefaultHasher`:
+/// its algorithm is explicitly documented as not stable across Rust releases,
+/// which would silently invalidate every cached thumbnail on every toolchain
+/// bump. The cache has no eviction policy, so orphaned entries would
+/// accumulate forever.
+///
+/// FNV-1a is a fixed, versioned, well-specified hash. The inputs here total
+/// ~30 bytes; cryptographic strength is irrelevant — we just need stability
+/// and a low collision rate over the lifetime of a project. Bump
+/// [`FORMAT_VERSION`] if this algorithm ever changes; old entries become
+/// unreachable rather than wrong.
 fn cache_key(path: &Path) -> Result<u64> {
     let canonical = fs::canonicalize(path)
         .with_context(|| format!("canonicalising {}", path.display()))?;
@@ -127,12 +134,58 @@ fn cache_key(path: &Path) -> Result<u64> {
         .unwrap_or_default();
     let size = meta.len();
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    mtime_dur.as_secs().hash(&mut hasher);
-    mtime_dur.subsec_nanos().hash(&mut hasher);
-    size.hash(&mut hasher);
-    Ok(hasher.finish())
+    let mut h = Fnv1a::new();
+    // Hash the path as raw bytes — `Path` is `OsStr` under the hood, so on
+    // Unix this is the underlying bytes and on Windows it's the WTF-8
+    // encoding of the wide string. Both are stable per-platform, which is
+    // all we need (the cache is keyed per-machine anyway).
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        h.write(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        h.write(canonical.to_string_lossy().as_bytes());
+    }
+    // Domain separator so e.g. a path that happens to end in the same byte
+    // pattern as an mtime can't collide.
+    h.write(b"|m|");
+    h.write(&mtime_dur.as_secs().to_le_bytes());
+    h.write(&mtime_dur.subsec_nanos().to_le_bytes());
+    h.write(b"|s|");
+    h.write(&size.to_le_bytes());
+    Ok(h.finish())
+}
+
+/// FNV-1a 64-bit. ~15 lines, zero deps, byte-stable forever.
+///
+/// Algorithm: start with the offset basis; for each byte, XOR then multiply
+/// by the FNV prime. We don't implement `std::hash::Hasher` here because
+/// that trait's `write_*` integer methods are platform-endian, and we want
+/// little-endian everywhere so the cache survives moving a project between
+/// machines of different endianness (admittedly unlikely on modern hardware,
+/// but free to get right).
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Fnv1a(Self::OFFSET)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 /// Resolve the cache directory and the file path for a given key. Returns
