@@ -1405,7 +1405,7 @@ impl AppState {
             return self.save_project_as_dialog();
         };
         let project = self.capture_project();
-        project::save_atomic(&project, &path)?;
+        write_project(&project, &path)?;
         info!("project saved → {}", path.display());
         self.config.remember_project(&path);
         Ok(())
@@ -1436,11 +1436,7 @@ impl AppState {
         }
         let Some(path) = dialog.save_file() else { return Ok(()) };
         let project = self.capture_project();
-        if bundle::is_bundle_path(&path) {
-            bundle::save_to_path(&project, &path)?;
-        } else {
-            project::save_atomic(&project, &path)?;
-        }
+        write_project(&project, &path)?;
         info!("project saved → {}", path.display());
         self.config.remember_project(&path);
         self.current_project_path = Some(path);
@@ -1894,6 +1890,19 @@ fn load_project_any(path: &Path) -> Result<project::Project> {
     }
 }
 
+/// Symmetric to `load_project_any`: dispatch the save by extension so
+/// a Cmd+S resave to `scene.sublyve` writes the zip bundle, not loose
+/// JSON wearing a `.sublyve` extension (which would be unloadable on
+/// reopen). Both `save_project` and `save_project_as_dialog` go
+/// through here so the two can't drift.
+fn write_project(project: &project::Project, path: &Path) -> Result<()> {
+    if bundle::is_bundle_path(path) {
+        bundle::save_to_path(project, path)
+    } else {
+        project::save_atomic(project, path)
+    }
+}
+
 fn resolve_monitor_index(
     requested: Option<usize>,
     monitors: &[MonitorHandle],
@@ -1913,5 +1922,59 @@ fn resolve_monitor_index(
         .iter()
         .position(|m| Some(m) == primary.as_ref())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_project() -> project::Project {
+        project::Project {
+            composition: project::CompositionSpec { width: 1280, height: 720 },
+            library: project::LibrarySpec { layers: 1, columns: 1, cells: vec![] },
+            layers: vec![],
+            output: project::OutputSpec { monitor_index: 0, fullscreen: false },
+            audio: project::AudioSpec { device_name: None, master_volume: 1.0 },
+        }
+    }
+
+    /// Regression guard for the merge between `recent-files-cmd-s` and
+    /// `feat/sublyve-bundle`: `save_project` (Cmd+S) used to call
+    /// `project::save_atomic` unconditionally, which silently clobbered
+    /// `.sublyve` bundles with loose JSON. Both save sites now go
+    /// through `write_project`; this test pins that contract.
+    #[test]
+    fn write_project_dispatches_by_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "sublyve-write-dispatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir tmp");
+
+        let project = empty_project();
+
+        let bundle_path = dir.join("scene.sublyve");
+        write_project(&project, &bundle_path).expect("write bundle");
+        let bytes = std::fs::read(&bundle_path).expect("read bundle");
+        assert_eq!(
+            &bytes[..4],
+            b"PK\x03\x04",
+            "expected zip magic for .sublyve, got non-bundle (Cmd+S resave regression?)"
+        );
+
+        let json_path = dir.join("scene.sublyve.json");
+        write_project(&project, &json_path).expect("write json");
+        let bytes = std::fs::read(&json_path).expect("read json");
+        assert!(
+            bytes.starts_with(b"{"),
+            "expected JSON for .sublyve.json"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
