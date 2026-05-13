@@ -100,8 +100,10 @@ pub struct UiActions {
     pub set_output_monitor: Option<usize>,
     pub set_output_fullscreen: Option<bool>,
     pub refresh_monitors: bool,
-    /// Browse… button on the bottom panel when the cue is parked on an
-    /// empty cell — opens a native file dialog and imports into (r, c).
+    /// Native file picker → import into `(r, c)`. Fires from the
+    /// empty-slot `Browse…` button, the filled-slot `Replace…` button,
+    /// and the right-click context menu on empty grid cells. If the
+    /// target cell already has a clip, `import_clip` overwrites it.
     pub browse_for_cell: Option<(usize, usize)>,
     /// Per-clip default-setting edits from the bottom inspector.
     pub set_clip_default_loop: Option<((usize, usize), bool)>,
@@ -286,7 +288,7 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(
-                    "Click=trigger · Shift+click=cue · Right-click=stop · Enter=Take",
+                    "Click=trigger · Shift+click=cue · Right-click=stop / browse · Enter=Take",
                 )
                 .small()
                 .weak(),
@@ -954,6 +956,20 @@ fn clip_metadata_inspector(
                 );
             }
 
+            // Replace-this-clip via native picker. Hidden for live
+            // capture sources — replacing a camera cell goes through
+            // the Camera tab's drag-drop, not the file dialog.
+            if !slot.source.is_live() {
+                ui.add_space(6.0);
+                if ui
+                    .button(egui::RichText::new("📂  Replace…").small())
+                    .on_hover_text("Pick a different video file for this cell")
+                    .clicked()
+                {
+                    actions.browse_for_cell = Some((row, col));
+                }
+            }
+
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(6.0);
@@ -1302,6 +1318,7 @@ fn cell_widget(
     //     parks the cue on the slot so the bottom inspector flips to
     //     "Browse…" mode.
     //   - Right-click on a filled cell  → stop the layer.
+    //   - Right-click on an empty cell  → context menu with `Browse…`.
     if response.clicked() || response.double_clicked() {
         let shift = ui.input(|i| i.modifiers.shift);
         if shift {
@@ -1310,8 +1327,20 @@ fn cell_widget(
             actions.trigger_cell = Some((row, col));
         }
     }
-    if clip.is_some() && response.secondary_clicked() {
-        actions.stop_layer_at = Some((row, col));
+    if clip.is_some() {
+        if response.secondary_clicked() {
+            actions.stop_layer_at = Some((row, col));
+        }
+    } else {
+        // Empty cell: right-click opens a small context menu so the
+        // native picker is discoverable even without first cueing the
+        // slot. Drag-drop stays as the fast path.
+        response.context_menu(|ui| {
+            if ui.button("📂  Browse for clip…").clicked() {
+                actions.browse_for_cell = Some((row, col));
+                ui.close_menu();
+            }
+        });
     }
 }
 
