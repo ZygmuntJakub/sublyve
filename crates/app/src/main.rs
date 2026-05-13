@@ -1755,10 +1755,23 @@ impl AppState {
         }
     }
 
-    /// Apply one undo step, if any. Frees any textures the dropped
-    /// slot was holding (they were re-installed in the library on
-    /// undo's behalf, so this is only for displaced slots — usually
-    /// empty for a simple place-then-undo).
+    /// Apply one undo step, if any.
+    ///
+    /// `apply_step` is a swap — the slot in history moves into the
+    /// library and whatever was in the library moves back into history.
+    /// No textures are freed here; that's the whole point of slot-
+    /// preservation. Texture freeing only happens when an op falls off
+    /// the cap (via `record_*`) or when the redo tail is truncated
+    /// (via `record_op` after an undo).
+    ///
+    /// An undo can re-install a slot that was holding the active clip
+    /// on a layer playing from `(row, col)`. The layer's decoder still
+    /// references the OLD slot, not the newly-installed one, which is
+    /// fine for files (the layer owns its own decoder) but means the
+    /// visible "active clip" badge can mismatch the cell. We don't try
+    /// to chase the layer state — undo is a *library* operation, not a
+    /// transport operation, per the design notes. The user can
+    /// re-trigger if they want the layer to play the restored clip.
     fn undo(&mut self) {
         let Some(label) = self.undo_history.peek_undo() else {
             info!("nothing to undo");
@@ -1766,20 +1779,14 @@ impl AppState {
         };
         if self.undo_history.undo(&mut self.library).is_some() {
             info!("undo: {label}");
-            // An undo can re-install a slot that was holding the
-            // active clip on a layer playing from `(row, col)`. The
-            // layer's decoder still references the OLD slot, not the
-            // newly-installed one, which is fine for files (the
-            // layer owns its own decoder) but means the visible
-            // "active clip" badge can mismatch the cell. We don't
-            // try to chase the layer state — undo is a *library*
-            // operation, not a transport operation, per the design
-            // notes. The user can re-trigger if they want the layer
-            // to play the restored clip.
         }
     }
 
     /// Apply one redo step, if any.
+    ///
+    /// Like `undo`, this is a swap inside the history — no textures
+    /// are freed here. Texture freeing only happens at the history
+    /// edges (cap eviction, redo-tail truncation, or `History::clear`).
     fn redo(&mut self) {
         let Some(label) = self.undo_history.peek_redo() else {
             info!("nothing to redo");
