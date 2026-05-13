@@ -9,7 +9,7 @@ mod thumb_cache;
 mod thumbs;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -277,6 +277,13 @@ struct AppState {
     /// or opens a project so the next launch can resume.
     config: config::AppConfig,
 
+    /// Path of the project file the user is currently editing. Set
+    /// after any successful save (dialog or Cmd+S) or load (CLI,
+    /// auto-resume, dialog, recent-files menu). Cleared on a save /
+    /// load failure that invalidates the previous path. Drives
+    /// Cmd+S's "resave silently vs. prompt" branch.
+    current_project_path: Option<PathBuf>,
+
     /// Which tab the bottom panel currently shows. Auto-switches on
     /// `cue` / `trigger` / `select_layer`; manual tab clicks come in
     /// via `UiActions::set_bottom_tab`.
@@ -470,6 +477,7 @@ impl AppState {
             bound_composition_gen: u64::MAX,
             audio_engine,
             config: app_config,
+            current_project_path: None,
             bottom_tab: ui::BottomTab::default(),
             right_tab: ui::RightTab::default(),
             cameras: avengine_playback::cameras::list().unwrap_or_else(|e| {
@@ -498,6 +506,7 @@ impl AppState {
                     } else {
                         info!("auto-loaded project ← {}", path.display());
                         state.config.remember_project(&path);
+                        state.current_project_path = Some(path);
                     }
                 }
                 Err(e) => {
@@ -1062,6 +1071,11 @@ impl AppState {
             if h == 0 { 16.0 / 9.0 } else { w as f32 / h as f32 }
         };
         let audio_devices = self.audio_engine.list_device_names();
+        // Stale-entry pruning runs only when the Open Recent submenu
+        // is actually open — see `UiActions::prune_recents`. Keeping
+        // it off the per-frame path avoids stat'ing every entry on
+        // every tick (the syscalls can block on network mounts or
+        // sleeping drives).
         let ui_ctx = UiContext {
             library: &self.library,
             layers: &layer_views,
@@ -1085,6 +1099,8 @@ impl AppState {
             bottom_tab: self.bottom_tab,
             right_tab: self.right_tab,
             cameras: &self.cameras,
+            recent_projects: &self.config.recent_projects,
+            current_project_path: self.current_project_path.as_ref(),
         };
         let actions = ui::draw_control(&self.control.egui_ctx, ui_ctx);
 
@@ -1346,16 +1362,58 @@ impl AppState {
         }
 
         if actions.save_project
-            && let Err(e) = self.save_project_dialog() {
+            && let Err(e) = self.save_project() {
                 error!("project save failed: {e:#}");
+            }
+        if actions.save_project_as
+            && let Err(e) = self.save_project_as_dialog() {
+                error!("project save-as failed: {e:#}");
             }
         if actions.open_project
             && let Err(e) = self.open_project_dialog() {
                 error!("project load failed: {e:#}");
             }
+        if let Some(path) = actions.open_recent_project.clone()
+            && let Err(e) = self.load_project_from_path(&path)
+        {
+            // `load_project_from_path` has already forgotten the
+            // path if the error was a load/parse failure (stale
+            // entry). `apply_project` failures leave the entry in
+            // place since they're likely transient — the user can
+            // retry from the same Recent menu.
+            error!("could not open recent project {}: {e:#}", path.display());
+        }
+        if actions.clear_recent_projects {
+            self.config.clear_recent_projects();
+        }
+        if actions.prune_recents {
+            // Submenu is open — refresh the on-disk view of each
+            // path. Bounded by `MAX_RECENT_PROJECTS` stat syscalls
+            // and only runs while the user is actually inspecting
+            // the list, so it can't block the render loop on a
+            // closed menu.
+            self.config.prune_missing_recents();
+        }
     }
 
-    fn save_project_dialog(&mut self) -> Result<()> {
+    /// Cmd+S / "Save" menu entry. Resaves to the existing project
+    /// path if one is known, otherwise falls through to the save-as
+    /// dialog so a fresh session's first save still picks a location.
+    fn save_project(&mut self) -> Result<()> {
+        let Some(path) = self.current_project_path.clone() else {
+            return self.save_project_as_dialog();
+        };
+        let project = self.capture_project();
+        project::save_atomic(&project, &path)?;
+        info!("project saved → {}", path.display());
+        self.config.remember_project(&path);
+        Ok(())
+    }
+
+    /// Cmd+Shift+S / "Save As…" menu entry / `💾 Save…` button — always
+    /// prompts. On success, the chosen path becomes the new
+    /// `current_project_path`.
+    fn save_project_as_dialog(&mut self) -> Result<()> {
         // Default the save dialog to the directory of whatever project
         // is currently loaded, so re-saving puts the file next to its
         // siblings instead of in `~`.
@@ -1364,18 +1422,19 @@ impl AppState {
             .add_filter("Sublyve project", &["sublyve.json", "json"])
             .set_file_name("project.sublyve.json");
         if let Some(parent) = self
-            .config
-            .last_project
+            .current_project_path
             .as_ref()
+            .or(self.config.last_project.as_ref())
             .and_then(|p| p.parent())
         {
             dialog = dialog.set_directory(parent);
         }
         let Some(path) = dialog.save_file() else { return Ok(()) };
         let project = self.capture_project();
-        project::save_to_path(&project, &path)?;
+        project::save_atomic(&project, &path)?;
         info!("project saved → {}", path.display());
         self.config.remember_project(&path);
+        self.current_project_path = Some(path);
         Ok(())
     }
 
@@ -1385,18 +1444,38 @@ impl AppState {
             .add_filter("Sublyve project", &["sublyve.json", "json"])
             .add_filter("All files", &["*"]);
         if let Some(parent) = self
-            .config
-            .last_project
+            .current_project_path
             .as_ref()
+            .or(self.config.last_project.as_ref())
             .and_then(|p| p.parent())
         {
             dialog = dialog.set_directory(parent);
         }
         let Some(path) = dialog.pick_file() else { return Ok(()) };
-        let project = project::load_from_path(&path)?;
+        self.load_project_from_path(&path)
+    }
+
+    /// Shared body for "Open Recent ▸ X" and the open dialog: load
+    /// the project, apply it, and record it as the current path.
+    ///
+    /// On a `load_from_path` failure (file gone / parse error) we
+    /// proactively forget the path so a stale Recent entry stops
+    /// reappearing. On `apply_project` failures we deliberately do
+    /// *not* — those are likely transient (a future fallible
+    /// rebuild step, GPU hiccup, …) and yanking the recent entry
+    /// would punish the user for a problem they didn't cause.
+    fn load_project_from_path(&mut self, path: &Path) -> Result<()> {
+        let project = match project::load_from_path(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.config.forget_project(path);
+                return Err(e);
+            }
+        };
         self.apply_project(project)?;
         info!("project loaded ← {}", path.display());
-        self.config.remember_project(&path);
+        self.config.remember_project(path);
+        self.current_project_path = Some(path.to_path_buf());
         Ok(())
     }
 
@@ -1813,3 +1892,4 @@ fn resolve_monitor_index(
         .position(|m| Some(m) == primary.as_ref())
         .unwrap_or(0)
 }
+

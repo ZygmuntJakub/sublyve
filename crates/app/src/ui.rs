@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use avengine_core::BlendMode;
 use avengine_playback::{CameraDevice, StreamInfo};
 use winit::monitor::MonitorHandle;
@@ -115,10 +117,24 @@ pub struct UiActions {
     pub set_layer_audio_gain: Option<(usize, f32)>,
     /// Switch the active output audio device to the named one.
     pub set_audio_device: Option<String>,
-    /// `💾 Save…` button — prompt for a path and save the project.
+    /// `💾 Save` action — Cmd+S or the Save menu entry. Resaves the
+    /// current project to its existing path if one is known, otherwise
+    /// falls through to the save-as dialog.
     pub save_project: bool,
+    /// `💾 Save As…` action — Cmd+Shift+S or the Save As menu entry.
+    /// Always opens the dialog regardless of `current_project_path`.
+    pub save_project_as: bool,
     /// `📂 Open…` button — prompt for a path and load a project.
     pub open_project: bool,
+    /// Recent-files submenu entry click — load this exact path.
+    pub open_recent_project: Option<PathBuf>,
+    /// "Clear recent files" menu entry.
+    pub clear_recent_projects: bool,
+    /// True on any frame the "Open Recent" submenu is being drawn.
+    /// AppState uses this as a "stat the entries now" signal so
+    /// `Path::exists()` calls only happen when the user is actually
+    /// looking at the menu, not on every render-loop tick.
+    pub prune_recents: bool,
     /// X button on the per-row quick-controls strip — clear the
     /// layer's active clip (drops decoder, kills audio + video).
     pub clear_layer: Option<usize>,
@@ -174,6 +190,12 @@ pub struct UiContext<'a> {
     pub right_tab: RightTab,
     /// Live capture devices the user can drag onto grid cells.
     pub cameras: &'a [CameraDevice],
+    /// Most-recently-used project paths for the `📂 Open…` submenu.
+    /// Already pruned of missing files by `AppState` before render.
+    pub recent_projects: &'a [PathBuf],
+    /// Path of the project currently being edited, if any. Powers
+    /// the `💾 Save` menu entry's enabled state + tooltip.
+    pub current_project_path: Option<&'a PathBuf>,
 }
 
 pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
@@ -263,6 +285,25 @@ fn panel_frame(alpha: u8) -> egui::Frame {
 }
 
 fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    // Keyboard shortcuts first so a binding pressed mid-frame is
+    // honored before the menu buttons (which would otherwise eat
+    // focus on the next interaction). `consume_shortcut` clears the
+    // event from egui's input queue once matched, so each shortcut
+    // fires exactly once per press.
+    let save_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+    let save_as_shortcut = egui::KeyboardShortcut::new(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::S,
+    );
+    // Order matters: Cmd+Shift+S also satisfies the Cmd+S modifier
+    // mask, so we check the more-specific binding first.
+    if ui.ctx().input_mut(|i| i.consume_shortcut(&save_as_shortcut)) {
+        actions.save_project_as = true;
+    }
+    if ui.ctx().input_mut(|i| i.consume_shortcut(&save_shortcut)) {
+        actions.save_project = true;
+    }
+
     ui.horizontal(|ui| {
         let label = if ctx.composition_playing { "⏸  Pause all" } else { "▶  Play all" };
         if ui.button(label).clicked() {
@@ -272,12 +313,8 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
             actions.restart_composition = true;
         }
         ui.separator();
-        if ui.button("📂  Open…").clicked() {
-            actions.open_project = true;
-        }
-        if ui.button("💾  Save…").clicked() {
-            actions.save_project = true;
-        }
+        open_menu(ui, ctx, actions);
+        save_menu(ui, ctx, actions, &save_shortcut, &save_as_shortcut);
         ui.separator();
         ui.label(format!(
             "{} layer{} · {} active",
@@ -295,6 +332,87 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
             );
         });
     });
+}
+
+/// `📂 Open…` menu — direct "Open project…" entry plus an "Open
+/// Recent" submenu of the last few project paths. Stale entries
+/// were already pruned by `AppState` before render so each path
+/// here is expected to resolve on click.
+fn open_menu(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
+    ui.menu_button("📂  Open…", |ui| {
+        if ui.button("Open project…").clicked() {
+            actions.open_project = true;
+            ui.close_menu();
+        }
+        ui.separator();
+        if ctx.recent_projects.is_empty() {
+            ui.add_enabled(false, egui::Button::new("Open Recent (empty)"));
+        } else {
+            ui.menu_button("Open Recent", |ui| {
+                // The body of `menu_button` only runs while the
+                // submenu is open. Flagging here means AppState
+                // refreshes the on-disk view of these paths on the
+                // frames the user is actually looking — and never
+                // on the render hot path.
+                actions.prune_recents = true;
+                for path in ctx.recent_projects {
+                    let label = recent_menu_label(path);
+                    if ui
+                        .button(label)
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        actions.open_recent_project = Some(path.clone());
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear recent files").clicked() {
+                    actions.clear_recent_projects = true;
+                    ui.close_menu();
+                }
+            });
+        }
+    });
+}
+
+/// `💾 Save…` menu — "Save" resaves to `current_project_path` when
+/// it's set, otherwise prompts. "Save As…" always prompts. Both
+/// mirror the keyboard shortcuts shown next to their labels.
+fn save_menu(
+    ui: &mut egui::Ui,
+    ctx: &UiContext<'_>,
+    actions: &mut UiActions,
+    save_shortcut: &egui::KeyboardShortcut,
+    save_as_shortcut: &egui::KeyboardShortcut,
+) {
+    ui.menu_button("💾  Save…", |ui| {
+        let save_label = match ctx.current_project_path {
+            Some(p) => format!("Save  ({})", recent_menu_label(p)),
+            None => "Save".to_string(),
+        };
+        let save_entry = egui::Button::new(save_label)
+            .shortcut_text(ui.ctx().format_shortcut(save_shortcut));
+        if ui.add(save_entry).clicked() {
+            actions.save_project = true;
+            ui.close_menu();
+        }
+        let save_as_entry = egui::Button::new("Save As…")
+            .shortcut_text(ui.ctx().format_shortcut(save_as_shortcut));
+        if ui.add(save_as_entry).clicked() {
+            actions.save_project_as = true;
+            ui.close_menu();
+        }
+    });
+}
+
+/// Compact label for the Open Recent submenu and the "Save (…)"
+/// hint: just the file name. The full path is available on hover
+/// so users can disambiguate two projects with the same file name.
+fn recent_menu_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn settings_panel(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
