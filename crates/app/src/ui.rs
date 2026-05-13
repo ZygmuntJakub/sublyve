@@ -50,6 +50,7 @@ pub struct LayerView<'a> {
     /// gain. Drag to 0 to fade the whole layer out at once.
     pub master: f32,
     pub mute: bool,
+    pub solo: bool,
     pub playing: bool,
     pub looping: bool,
     pub speed: f64,
@@ -85,6 +86,7 @@ pub struct UiActions {
     pub select_layer: Option<usize>,
     /// Per-layer mutations.
     pub set_layer_mute: Option<(usize, bool)>,
+    pub set_layer_solo: Option<(usize, bool)>,
     pub set_layer_blend: Option<(usize, BlendMode)>,
     pub set_layer_opacity: Option<(usize, f32)>,
     pub set_layer_looping: Option<(usize, bool)>,
@@ -592,10 +594,23 @@ fn layer_inspector_body(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut Ui
 
     // Compositing controls (always available, even on empty layers, so
     // the user can preset a blend / opacity before triggering a clip).
-    let mut mute = layer.mute;
-    if ui.checkbox(&mut mute, "Mute").changed() {
-        actions.set_layer_mute = Some((layer.index, mute));
-    }
+    ui.horizontal(|ui| {
+        let mut mute = layer.mute;
+        if ui.checkbox(&mut mute, "Mute").changed() {
+            actions.set_layer_mute = Some((layer.index, mute));
+        }
+        let mut solo = layer.solo;
+        if ui.checkbox(&mut solo, "Solo").changed() {
+            actions.set_layer_solo = Some((layer.index, solo));
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "Mute silences this layer; Solo silences all other layers (Mute wins over Solo).",
+        )
+        .small()
+        .weak(),
+    );
 
     let mut blend = layer.blend_mode;
     egui::ComboBox::from_label("Blend")

@@ -388,7 +388,14 @@ impl AppState {
         }
         let audio_config = audio_engine.audio_config();
 
-        let composition = Composition::new(&gpu, audio_handles, audio_config, comp_w, comp_h);
+        let composition = Composition::new(
+            &gpu,
+            audio_handles,
+            audio_config,
+            comp_w,
+            comp_h,
+            audio_engine.any_solo_active(),
+        );
         info!(
             "composition: {}x{}, {} layer(s) × {} column(s); audio device: {:?}",
             comp_w,
@@ -806,12 +813,20 @@ impl AppState {
         self.selected_layer = Some(row);
         // The user just acted on a layer — show its inspector.
         self.bottom_tab = ui::BottomTab::Layer;
+        // Empty→non-empty transition: a soloed-but-empty layer
+        // becomes "actually soloed" the moment a clip lands on it.
+        // recompute_solo only counts non-empty soloed layers.
+        self.composition.recompute_solo();
     }
 
     fn stop_layer(&mut self, row: usize) {
         if let Some(layer) = self.composition.layers.get_mut(row) {
             layer.clear();
         }
+        // Non-empty→empty transition: if the just-cleared layer was
+        // the only soloed layer with a clip, the aggregate flips off
+        // and the rest of the composition becomes audible/visible.
+        self.composition.recompute_solo();
     }
 
     fn refresh_monitors(&mut self) {
@@ -994,6 +1009,7 @@ impl AppState {
                 opacity: l.opacity,
                 master: l.master,
                 mute: l.mute,
+                solo: l.solo,
                 playing: l.transport.playing,
                 looping: l.transport.looping,
                 speed: l.transport.speed,
@@ -1177,6 +1193,9 @@ impl AppState {
             && let Some(l) = self.composition.layers.get_mut(i) {
                 l.set_mute(mute);
             }
+        if let Some((i, solo)) = actions.set_layer_solo {
+            self.composition.set_layer_solo(i, solo);
+        }
         if let Some((i, gain)) = actions.set_layer_audio_gain
             && let Some(l) = self.composition.layers.get(i) {
                 l.set_audio_gain(gain);
@@ -1188,6 +1207,7 @@ impl AppState {
         if let Some(idx) = actions.clear_layer
             && let Some(l) = self.composition.layers.get_mut(idx) {
                 l.clear();
+                self.composition.recompute_solo();
             }
         if let Some((idx, secs)) = actions.seek_layer
             && let Some(l) = self.composition.layers.get_mut(idx) {
@@ -1394,6 +1414,9 @@ impl AppState {
             .push(Layer::new_pending_audio(&self.gpu, cfg));
         self.library.add_layer(MAX_LAYERS);
         self.rebuild_audio_for_current_device();
+        // New layer is solo=false; aggregate is unchanged but recompute
+        // is cheap and keeps the contract uniform across mutation sites.
+        self.composition.recompute_solo();
     }
 
     /// Drop the highest-indexed layer (= the row visually at the top
@@ -1437,6 +1460,9 @@ impl AppState {
         }
 
         self.rebuild_audio_for_current_device();
+        // Removed layer might have been the only soloed one; recompute
+        // so non-soloed layers come back if appropriate.
+        self.composition.recompute_solo();
     }
 
     /// Append an empty column on the right of the grid. No audio
@@ -1467,6 +1493,9 @@ impl AppState {
                 layer.clear();
             }
         }
+        // Recompute aggregate after the bulk clear — any of those
+        // layers might have been the only soloed one.
+        self.composition.recompute_solo();
         if let Some((_, c)) = self.cued
             && c >= self.library.columns()
         {
@@ -1611,9 +1640,13 @@ impl AppState {
             layer.blend_mode = spec.blend;
             layer.opacity = spec.opacity;
             layer.set_mute(spec.mute);
+            layer.set_solo(spec.solo);
             layer.set_audio_gain(spec.audio_gain);
             layer.set_master(spec.master);
         }
+        // Refresh the shared `any_solo_active` aggregate after the
+        // batch of per-layer settings.
+        self.composition.recompute_solo();
 
         // Library: import every saved cell. Each call decodes a
         // thumbnail and registers it with egui — synchronous, so
@@ -1711,6 +1744,7 @@ impl AppState {
                 mute: l.mute,
                 audio_gain: l.audio_gain(),
                 master: l.master,
+                solo: l.solo,
             })
             .collect();
         project::Project {

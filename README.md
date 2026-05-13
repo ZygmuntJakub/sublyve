@@ -109,12 +109,12 @@ Enumeration uses FFmpeg's `avdevice_list_input_sources` API — `avfoundation` o
 
 ## Save / Load project
 
-`💾 Save…` and `📂 Open…` in the top transport bar persist the workspace as a JSON project file (`.sublyve.json`). The format is human-readable and version-stamped (`{ "version": 3, "project": { … } }`); the loader rejects newer versions with a clear error rather than misinterpreting fields. Older versions still load — `version: 1` files (no `master` field on layers) come in with master defaulting to 1.0; `version: 2` files (cells held a bare `path` field) migrate cells into `source: { type: "File", path: … }` on load.
+`💾 Save…` and `📂 Open…` in the top transport bar persist the workspace as a JSON project file (`.sublyve.json`). The format is human-readable and version-stamped (`{ "version": 4, "project": { … } }`); the loader rejects newer versions with a clear error rather than misinterpreting fields. Older versions still load — `version: 1` files (no `master` field on layers) come in with master defaulting to 1.0; `version: 2` files (cells held a bare `path` field) migrate cells into `source: { type: "File", path: … }` on load; `version: 3` files (no `solo` field on layers) come in with solo defaulting to false.
 
 What's saved:
 
-- **Library cells**: every occupied `(row, col)` with its source — `File { path }` for video files (absolute path) or `Camera { format_name, device, display_name }` for live capture devices — and per-clip defaults (loop / speed / blend; loop and speed are silently ignored at trigger time for camera cells).
-- **Per-layer compositing**: `blend_mode`, `opacity`, `mute`, `audio_gain`, and `master` (added in schema v2) for every layer.
+- **Library cells**: every occupied `(row, col)` with its source — `File { path }` for video files (absolute path) or `Camera { format_name, device, display_name, has_audio }` for live capture devices — and per-clip defaults (loop / speed / blend; loop and speed are silently ignored at trigger time for camera cells).
+- **Per-layer compositing**: `blend_mode`, `opacity`, `mute`, `solo` (added in schema v4), `audio_gain`, and `master` (added in schema v2) for every layer.
 - **Composition**: target width × height. Loading resizes the offscreen target if it differs.
 - **Output**: monitor index (best-effort by index across reboots), fullscreen flag.
 - **Audio**: device name, master volume.
@@ -141,6 +141,7 @@ Each layer decodes both the video and audio streams of its clip in a single FFmp
 
 - **Per-layer audio gain** in the bottom panel's Layer tab (0.0 – 2.0).
 - **Per-layer mute** silences both video and audio.
+- **Per-layer solo** — when any layer is soloed, every non-soloed layer is silenced *and* hidden until you turn the solos off (multiple layers can be soloed at once; mute always wins over solo). Solo on an empty layer is inert until a clip lands on it. Both audio and video gate on the same shared atomic, so the two paths can't drift.
 - **Master volume** on the right panel's **Audio** tab.
 - **Device selection**: at startup via `--audio-device <name>` (use `--list-audio-devices` to discover names), or live from the **Audio · Output** combobox on the same tab. Switching mid-session drops the active cpal stream, allocates fresh per-layer ring buffers (preserving each layer's gain / mute settings via the shared `Arc<AudioLayerControl>`), and builds a new stream — a brief audio gap, no app stall.
 - Clips with no audio stream are silently skipped on the audio side; their video plays normally.
@@ -167,7 +168,6 @@ Audio + video are not yet PTS-locked — they share a wall-clock pump driven by 
 - [ ] Per-clip transform (Position X/Y, Scale, Rotate) — Resolume parameter inspector parity.
 - [ ] Column launch (one shortcut triggers every layer at column N).
 - [ ] Native file picker (replace the drag-drop-only flow).
-- [ ] Solo (alongside the existing Mute).
 - [ ] More blend modes — `Overlay` needs a custom shader, not a fixed-function blend state.
 - [ ] Composition save/load.
 - [ ] Effects pipeline (brightness, contrast, HSV, chroma key) — render targets per layer chain through effect passes.

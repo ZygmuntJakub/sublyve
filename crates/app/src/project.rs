@@ -18,7 +18,8 @@ use crate::library::{CellSource, ClipDefaults};
 /// - `3`: cells become source-discriminated (`File { path }` vs
 ///   `Camera { format_name, device, display_name }`). v2 cells with a
 ///   bare `path` field are migrated into `File` on load.
-pub const CURRENT_VERSION: u32 = 3;
+/// - `4`: adds `solo` to `LayerSpec` (defaults to false for older files).
+pub const CURRENT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectFile {
@@ -100,6 +101,10 @@ pub struct LayerSpec {
     /// the JSON omits it — keeps v1 files loading cleanly.
     #[serde(default = "default_master")]
     pub master: f32,
+    /// Solo flag (added in schema v4). Defaults to false when the JSON
+    /// omits it — keeps v1/v2/v3 files loading cleanly.
+    #[serde(default)]
+    pub solo: bool,
 }
 
 fn default_master() -> f32 {
@@ -294,6 +299,7 @@ mod tests {
                     mute: false,
                     audio_gain: 1.0,
                     master: 1.0,
+                    solo: true,
                 },
                 LayerSpec {
                     index: 1,
@@ -302,6 +308,7 @@ mod tests {
                     mute: false,
                     audio_gain: 0.3,
                     master: 0.75,
+                    solo: false,
                 },
             ],
             output: OutputSpec {
@@ -409,6 +416,39 @@ mod tests {
             }
             other => panic!("expected File source, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v3_files_load_with_solo_defaulting_to_false() {
+        // A `version: 3` JSON has no `solo` field on each layer.
+        // `#[serde(default)]` fills it in as `false`.
+        let json = r#"{
+            "version": 3,
+            "project": {
+                "composition": {"width": 1920, "height": 1080},
+                "library": {"layers": 2, "columns": 4, "cells": []},
+                "layers": [
+                    {"index": 0, "blend": "Normal", "opacity": 1.0,
+                     "mute": false, "audio_gain": 1.0, "master": 1.0},
+                    {"index": 1, "blend": "Add", "opacity": 0.5,
+                     "mute": true, "audio_gain": 0.0, "master": 0.5}
+                ],
+                "output": {"monitor_index": 0, "fullscreen": false},
+                "audio": {"device_name": null, "master_volume": 1.0}
+            }
+        }"#;
+        let dir = tempdir_path();
+        let path = dir.join("v3.sublyve.json");
+        std::fs::write(&path, json).expect("write tmp");
+        let loaded = load_from_path(&path).expect("load v3");
+        assert_eq!(loaded.layers.len(), 2);
+        for spec in &loaded.layers {
+            assert!(!spec.solo, "v3 layer must default solo to false");
+        }
+        // Pre-existing fields still parse.
+        assert_eq!(loaded.layers[1].master, 0.5);
+        assert!(loaded.layers[1].mute);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -31,6 +31,11 @@ pub struct Layer {
     /// is "completely faded out". Drives the live quick-controls strip.
     pub master: f32,
     pub mute: bool,
+    /// True if this layer is in solo mode. When any layer in the
+    /// composition has `solo=true`, every non-soloed layer is silenced
+    /// (audio) and skipped from rendering (video). Multiple layers can
+    /// be soloed at once (additive solo). Mute always wins over solo.
+    pub solo: bool,
 
     /// Column of the currently-loaded clip (or `None` if the layer is empty).
     pub active_col: Option<usize>,
@@ -116,6 +121,7 @@ impl Layer {
             opacity: 1.0,
             master: 1.0,
             mute: false,
+            solo: false,
             active_col: None,
             is_live: false,
             transport: Transport::new(),
@@ -193,8 +199,15 @@ impl Layer {
         self.worker.is_none()
     }
 
-    pub fn is_visible(&self) -> bool {
-        !self.mute && !self.is_empty() && self.opacity * self.master > 0.001
+    /// `any_solo` is the composition-wide "is at least one layer
+    /// soloed" flag, threaded down from `Composition::render`. When it
+    /// is true, only soloed layers stay visible; otherwise solo is
+    /// inert and every non-muted, non-empty, non-faded layer renders.
+    pub fn is_visible(&self, any_solo: bool) -> bool {
+        !self.mute
+            && (!any_solo || self.solo)
+            && !self.is_empty()
+            && self.opacity * self.master > 0.001
     }
 
     /// Load a clip into this layer. Replaces any existing decoder.
@@ -362,6 +375,17 @@ impl Layer {
         self.mute = muted;
         if let Some(a) = self.audio.as_ref() {
             a.control.set_muted(muted);
+        }
+    }
+
+    /// Set the solo flag. The composition-wide aggregate is recomputed
+    /// by `Composition::set_layer_solo`; this method just updates the
+    /// per-layer state (visual side) and propagates to the
+    /// `AudioLayerControl` atomic so the audio thread sees it.
+    pub fn set_solo(&mut self, solo: bool) {
+        self.solo = solo;
+        if let Some(a) = self.audio.as_ref() {
+            a.control.set_soloed(solo);
         }
     }
 
@@ -569,8 +593,13 @@ impl Layer {
         }
     }
 
-    pub fn draw(&self, rpass: &mut wgpu::RenderPass<'_>, pipelines: &VideoPipelines) {
-        if !self.is_visible() {
+    pub fn draw(
+        &self,
+        rpass: &mut wgpu::RenderPass<'_>,
+        pipelines: &VideoPipelines,
+        any_solo: bool,
+    ) {
+        if !self.is_visible(any_solo) {
             return;
         }
         let Some(bg) = self.bind_group.as_ref() else {

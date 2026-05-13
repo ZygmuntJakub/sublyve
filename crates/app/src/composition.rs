@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use avengine_compositor::{CompositionTarget, GpuContext, VideoPipelines};
 use avengine_playback::AudioConfig;
 
@@ -10,26 +13,61 @@ use crate::layer::Layer;
 pub struct Composition {
     pub layers: Vec<Layer>,
     pub target: CompositionTarget,
+    /// Shared aggregate "is at least one layer soloed" flag. Owned by
+    /// `AudioEngine` (so it survives audio-device switches); cloned in
+    /// here so the render path reads from the same atomic the cpal
+    /// callback reads. Updated via `recompute_solo`.
+    pub any_solo_active: Arc<AtomicBool>,
 }
 
 impl Composition {
     /// Build a composition. One `AudioLayerHandle` per layer is consumed
     /// — the producer ends end up inside the `Layer`s, the matching
     /// consumer ends are already wired into the audio engine's cpal
-    /// stream by the caller.
+    /// stream by the caller. `any_solo_active` is sourced from
+    /// `AudioEngine::any_solo_active()` and is the same Arc the audio
+    /// thread reads in its mix loop.
     pub fn new(
         gpu: &GpuContext,
         audio_handles: Vec<AudioLayerHandle>,
         audio_config: AudioConfig,
         width: u32,
         height: u32,
+        any_solo_active: Arc<AtomicBool>,
     ) -> Self {
         let layers = audio_handles
             .into_iter()
             .map(|h| Layer::new(gpu, h, audio_config))
             .collect();
         let target = CompositionTarget::new(&gpu.device, width, height);
-        Self { layers, target }
+        Self {
+            layers,
+            target,
+            any_solo_active,
+        }
+    }
+
+    /// Recompute the shared `any_solo_active` atomic from the current
+    /// per-layer `solo` flags. Must be called after any mutation that
+    /// adds/removes layers or flips a `solo` flag.
+    ///
+    /// **Empty layers don't count.** A soloed-but-empty layer would
+    /// otherwise silence + hide every other layer in the composition
+    /// (the soloed slot has nothing to show), which is a footgun. Solo
+    /// on an empty layer is inert until a clip is triggered onto it.
+    pub fn recompute_solo(&self) {
+        let any = self.layers.iter().any(|l| l.solo && !l.is_empty());
+        self.any_solo_active.store(any, Ordering::Relaxed);
+    }
+
+    /// Flip a layer's solo flag and refresh the aggregate. The action
+    /// handler in `main.rs` calls this rather than poking the layer
+    /// directly so the aggregate never drifts.
+    pub fn set_layer_solo(&mut self, idx: usize, solo: bool) {
+        if let Some(l) = self.layers.get_mut(idx) {
+            l.set_solo(solo);
+        }
+        self.recompute_solo();
     }
 
     pub fn tick(&mut self, gpu: &GpuContext, dt: f64) {
@@ -63,8 +101,9 @@ impl Composition {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        let any_solo = self.any_solo_active.load(Ordering::Relaxed);
         for layer in &self.layers {
-            layer.draw(&mut rpass, pipelines);
+            layer.draw(&mut rpass, pipelines, any_solo);
         }
     }
 

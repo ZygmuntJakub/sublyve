@@ -35,6 +35,7 @@ pub struct AudioLayerControl {
     /// and both buses go silent / black at once.
     pub master_bits: AtomicU32,
     pub muted: AtomicBool,
+    pub soloed: AtomicBool,
 }
 
 impl Default for AudioLayerControl {
@@ -43,6 +44,7 @@ impl Default for AudioLayerControl {
             gain_bits: AtomicU32::new(1.0_f32.to_bits()),
             master_bits: AtomicU32::new(1.0_f32.to_bits()),
             muted: AtomicBool::new(false),
+            soloed: AtomicBool::new(false),
         }
     }
 }
@@ -70,6 +72,14 @@ impl AudioLayerControl {
 
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    pub fn set_soloed(&self, soloed: bool) {
+        self.soloed.store(soloed, Ordering::Relaxed);
+    }
+
+    pub fn is_soloed(&self) -> bool {
+        self.soloed.load(Ordering::Relaxed)
     }
 }
 
@@ -116,6 +126,12 @@ struct MixSource {
 pub struct AudioEngine {
     host: cpal::Host,
     master: Arc<AtomicU32>,
+    /// Aggregate "is any layer soloed" flag. Owned here (not on
+    /// `Composition`) so it survives audio-device switches alongside
+    /// the per-layer `AudioLayerControl` Arcs. The same Arc is cloned
+    /// into the cpal mix closure and into `Composition` so both the
+    /// audio thread and the render path can read it lock-free.
+    any_solo_active: Arc<AtomicBool>,
     /// Consumer ends waiting to be wired into a cpal stream. `start`
     /// drains this; subsequent `start` calls (device switch) need to
     /// rebuild while preserving the same ring buffers — a V2 task.
@@ -143,11 +159,19 @@ impl AudioEngine {
         let engine = Self {
             host,
             master: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            any_solo_active: Arc::new(AtomicBool::new(false)),
             pending: Some(sources),
             stream: None,
             current_device: None,
         };
         (engine, handles)
+    }
+
+    /// Hand out a clone of the shared "any layer soloed" flag.
+    /// `Composition` keeps a clone so the render path can gate
+    /// non-soloed layers in lockstep with the audio thread.
+    pub fn any_solo_active(&self) -> Arc<AtomicBool> {
+        self.any_solo_active.clone()
     }
 
     pub fn list_device_names(&self) -> Vec<String> {
@@ -259,6 +283,7 @@ impl AudioEngine {
 
         let mut mix_sources = sources;
         let master = self.master.clone();
+        let any_solo = self.any_solo_active.clone();
         let mut scratch = vec![0.0_f32; 8192];
 
         let err_handler = |e| warn!("audio stream error: {e}");
@@ -267,7 +292,7 @@ impl AudioEngine {
             cpal::SampleFormat::F32 => device.build_output_stream(
                 &stream_config,
                 move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    mix(output, &mut mix_sources, &master, &mut scratch);
+                    mix(output, &mut mix_sources, &master, &any_solo, &mut scratch);
                 },
                 err_handler,
                 None,
@@ -322,12 +347,17 @@ fn mix(
     output: &mut [f32],
     sources: &mut [MixSource],
     master: &AtomicU32,
+    any_solo_active: &AtomicBool,
     scratch: &mut [f32],
 ) {
     output.fill(0.0);
+    let any_solo = any_solo_active.load(Ordering::Relaxed);
     for src in sources.iter_mut() {
-        if src.control.is_muted() {
-            // Drain so the buffer doesn't backlog while muted.
+        // Mute is the hard kill; solo silences every non-soloed source
+        // when at least one source is soloed. Mute wins over solo.
+        let silenced = src.control.is_muted() || (any_solo && !src.control.is_soloed());
+        if silenced {
+            // Drain so the buffer doesn't backlog while silenced.
             let _ = src.consumer.pop_slice(scratch);
             continue;
         }
