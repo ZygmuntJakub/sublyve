@@ -10,8 +10,9 @@
 //!
 //! - **macOS**: register an observer on `NSNotificationCenter` for
 //!   `AVCaptureDeviceWasConnectedNotification` /
-//!   `AVCaptureDeviceWasDisconnectedNotification`. The observer runs on
-//!   a background `NSRunLoop` thread and forwards a `()` per notification.
+//!   `AVCaptureDeviceWasDisconnectedNotification`. AVFoundation delivers
+//!   the block on its own GCD worker thread (we register with
+//!   `queue: nil`), so the registering thread is free to park.
 //! - **Other platforms** (Linux / Windows): slow re-poll thread that
 //!   calls [`crate::cameras::list`] every two seconds and only signals
 //!   when the result actually differs from the previous snapshot. This
@@ -107,10 +108,20 @@ mod macos {
     //! `AVCaptureDeviceWasDisconnectedNotification` whenever the
     //! capture-device set changes (USB cameras, Continuity Camera
     //! iPhones, virtual cameras, etc.). Subscribing is just
-    //! `NSNotificationCenter.defaultCenter.addObserverForName:...` —
-    //! but the block fires on whatever run loop happens to be current,
-    //! so we spin up a dedicated background thread, attach a port to
-    //! its `NSRunLoop`, and run it forever.
+    //! `NSNotificationCenter.defaultCenter.addObserverForName:...`.
+    //!
+    //! ## Threading
+    //!
+    //! We register with `queue: nil`, which tells AVFoundation to
+    //! dispatch the block on an arbitrary GCD worker thread — *not*
+    //! the thread that called `addObserverForName:`. That means the
+    //! thread we spin up here has no real work to do after
+    //! registration: the notification center retains the block, the
+    //! observer token is leaked into Cocoa's retain pool, and
+    //! deliveries happen on GCD. The thread then just `park()`s
+    //! forever so it (and anything it owns) sticks around for the
+    //! life of the process. A future cleanup could register on the
+    //! main thread and skip the spawn entirely.
     //!
     //! ## Safety
     //!
@@ -118,19 +129,17 @@ mod macos {
     //! `NSNotificationCenter` to call us back when notifications with
     //! known names appear. That means no AVFoundation linkage and no
     //! permission prompt (TCC isn't triggered until you actually open
-    //! a device). The observer block captures the `Sender` and is
-    //! retained by the notification center for the life of the
+    //! a device). The observer block captures a cloned `Sender` and
+    //! is retained by the notification center for the life of the
     //! process.
 
     use std::ptr::NonNull;
-    use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::mpsc::Sender;
     use std::thread;
 
     use block2::RcBlock;
     use objc2_foundation::{
-        NSNotification, NSNotificationCenter, NSNotificationName, NSRunLoop, NSString,
+        NSNotification, NSNotificationCenter, NSNotificationName, NSString,
     };
 
     pub(super) fn spawn(tx: Sender<()>) {
@@ -141,12 +150,6 @@ mod macos {
     }
 
     fn run(tx: Sender<()>) {
-        // `std::sync::mpsc::Sender` is `Send` but not `Sync` — Cocoa
-        // can deliver notifications from arbitrary threads when we
-        // pass `queue: nil`, so we serialise sends behind a Mutex.
-        // The lock is held only for the duration of one channel
-        // send (microseconds), so contention is a non-issue.
-        let tx = Arc::new(Mutex::new(tx));
         // NSNotificationCenter and the singleton NSStrings are
         // thread-safe; we set everything up here and never touch
         // these objects from other threads.
@@ -158,35 +161,38 @@ mod macos {
         let connected = NSString::from_str("AVCaptureDeviceWasConnectedNotification");
         let disconnected = NSString::from_str("AVCaptureDeviceWasDisconnectedNotification");
 
+        // `Sender<()>` is `Clone`, so each block can own its own
+        // copy — no Mutex needed. Sends from different GCD threads
+        // are independently safe because the channel itself is
+        // internally synchronised.
         register(&center, &connected, tx.clone());
         register(&center, &disconnected, tx);
 
-        // Park this thread on its run loop forever. Cocoa's
-        // notification center delivers block callbacks via run-loop
-        // sources, so without this `run()` call we'd register and
-        // exit immediately and never see a notification.
-        NSRunLoop::currentRunLoop().run();
+        // The blocks are delivered on GCD worker threads (we passed
+        // `queue: nil`), not on this thread, so there's nothing for
+        // a run loop to drain here. We just park forever to keep
+        // this thread alive — and with it the observer registration,
+        // which is already leaked into Cocoa's retain pool. The
+        // `loop` guards against spurious unparks. `park()` is the
+        // right primitive: zero CPU, zero wakeups under normal
+        // operation, and the OS can suspend the thread entirely.
+        loop {
+            thread::park();
+        }
     }
 
     /// Register an observer block that sends `()` on `tx` every time
     /// a notification with `name` is posted. `nil` object = match any
-    /// sender; `nil` queue = run the block synchronously on the
-    /// posting thread. The send is non-blocking so doing it inline
-    /// is fine.
-    fn register(
-        center: &NSNotificationCenter,
-        name: &NSNotificationName,
-        tx: Arc<Mutex<Sender<()>>>,
-    ) {
+    /// sender; `nil` queue = AVFoundation picks a GCD worker thread.
+    /// The send is non-blocking so doing it inline is fine.
+    fn register(center: &NSNotificationCenter, name: &NSNotificationName, tx: Sender<()>) {
         // The notification center retains the block for the life of
         // the registration; `RcBlock::new` heap-allocates and the
         // center bumps the refcount on its own copy. We then drop
         // our handle — the block stays alive inside Cocoa.
         let block = RcBlock::new(move |_note: NonNull<NSNotification>| {
             // Receiver gone → app is shutting down; silently drop.
-            if let Ok(tx) = tx.lock() {
-                let _ = tx.send(());
-            }
+            let _ = tx.send(());
         });
 
         // addObserverForName:object:queue:usingBlock: returns an
