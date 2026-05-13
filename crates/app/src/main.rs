@@ -1071,10 +1071,11 @@ impl AppState {
             if h == 0 { 16.0 / 9.0 } else { w as f32 / h as f32 }
         };
         let audio_devices = self.audio_engine.list_device_names();
-        // Drop any recent entries whose files have since moved so the
-        // submenu only ever offers live paths. Cheap (`Path::exists`
-        // syscall per entry, bounded by `MAX_RECENT_PROJECTS`).
-        self.config.prune_missing_recents();
+        // Stale-entry pruning runs only when the Open Recent submenu
+        // is actually open — see `UiActions::prune_recents`. Keeping
+        // it off the per-frame path avoids stat'ing every entry on
+        // every tick (the syscalls can block on network mounts or
+        // sleeping drives).
         let ui_ctx = UiContext {
             library: &self.library,
             layers: &layer_views,
@@ -1375,17 +1376,23 @@ impl AppState {
         if let Some(path) = actions.open_recent_project.clone()
             && let Err(e) = self.load_project_from_path(&path)
         {
+            // `load_project_from_path` has already forgotten the
+            // path if the error was a load/parse failure (stale
+            // entry). `apply_project` failures leave the entry in
+            // place since they're likely transient — the user can
+            // retry from the same Recent menu.
             error!("could not open recent project {}: {e:#}", path.display());
-            // The user clicked a stale entry — drop it so the next
-            // menu render doesn't offer it again.
-            self.config.recent_projects.retain(|p| p != &path);
-            if self.config.last_project.as_deref() == Some(path.as_path()) {
-                self.config.last_project = None;
-            }
-            let _ = self.config.save();
         }
         if actions.clear_recent_projects {
             self.config.clear_recent_projects();
+        }
+        if actions.prune_recents {
+            // Submenu is open — refresh the on-disk view of each
+            // path. Bounded by `MAX_RECENT_PROJECTS` stat syscalls
+            // and only runs while the user is actually inspecting
+            // the list, so it can't block the render loop on a
+            // closed menu.
+            self.config.prune_missing_recents();
         }
     }
 
@@ -1397,7 +1404,7 @@ impl AppState {
             return self.save_project_as_dialog();
         };
         let project = self.capture_project();
-        save_project_atomic(&project, &path)?;
+        project::save_atomic(&project, &path)?;
         info!("project saved → {}", path.display());
         self.config.remember_project(&path);
         Ok(())
@@ -1424,7 +1431,7 @@ impl AppState {
         }
         let Some(path) = dialog.save_file() else { return Ok(()) };
         let project = self.capture_project();
-        save_project_atomic(&project, &path)?;
+        project::save_atomic(&project, &path)?;
         info!("project saved → {}", path.display());
         self.config.remember_project(&path);
         self.current_project_path = Some(path);
@@ -1450,10 +1457,21 @@ impl AppState {
 
     /// Shared body for "Open Recent ▸ X" and the open dialog: load
     /// the project, apply it, and record it as the current path.
-    /// Errors bubble up so the caller can decide whether to drop the
-    /// path from the recent list (we do, on the menu side).
+    ///
+    /// On a `load_from_path` failure (file gone / parse error) we
+    /// proactively forget the path so a stale Recent entry stops
+    /// reappearing. On `apply_project` failures we deliberately do
+    /// *not* — those are likely transient (a future fallible
+    /// rebuild step, GPU hiccup, …) and yanking the recent entry
+    /// would punish the user for a problem they didn't cause.
     fn load_project_from_path(&mut self, path: &Path) -> Result<()> {
-        let project = project::load_from_path(path)?;
+        let project = match project::load_from_path(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.config.forget_project(path);
+                return Err(e);
+            }
+        };
         self.apply_project(project)?;
         info!("project loaded ← {}", path.display());
         self.config.remember_project(path);
@@ -1875,33 +1893,3 @@ fn resolve_monitor_index(
         .unwrap_or(0)
 }
 
-/// Wrap `project::save_to_path` in a write-to-temp + rename so a
-/// crash mid-write can't truncate the existing project file. The
-/// temp file lives in the same directory as the target so `rename`
-/// stays within one filesystem (cross-fs rename would fall back to
-/// copy+delete and lose atomicity). If the temp write succeeds but
-/// the rename fails, we clean up the temp file rather than leaking
-/// it next to the project.
-fn save_project_atomic(project: &project::Project, path: &Path) -> Result<()> {
-    let tmp = match path.file_name() {
-        Some(name) => {
-            let mut tmp_name = std::ffi::OsString::from(name);
-            tmp_name.push(".tmp");
-            path.with_file_name(tmp_name)
-        }
-        // Edge case: path has no file_name (e.g. `/`). Save in place
-        // — losing atomicity here is a tiny price for never panicking
-        // on a degenerate user input.
-        None => return project::save_to_path(project, path),
-    };
-    project::save_to_path(project, &tmp)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::from(e).context(format!(
-            "renaming {} → {}",
-            tmp.display(),
-            path.display()
-        )));
-    }
-    Ok(())
-}

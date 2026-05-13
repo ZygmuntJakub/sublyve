@@ -128,6 +128,11 @@ pub struct UiActions {
     pub open_recent_project: Option<PathBuf>,
     /// "Clear recent files" menu entry.
     pub clear_recent_projects: bool,
+    /// True on any frame the "Open Recent" submenu is being drawn.
+    /// AppState uses this as a "stat the entries now" signal so
+    /// `Path::exists()` calls only happen when the user is actually
+    /// looking at the menu, not on every render-loop tick.
+    pub prune_recents: bool,
     /// X button on the per-row quick-controls strip — clear the
     /// layer's active clip (drops decoder, kills audio + video).
     pub clear_layer: Option<usize>,
@@ -342,6 +347,12 @@ fn open_menu(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions) {
             ui.add_enabled(false, egui::Button::new("Open Recent (empty)"));
         } else {
             ui.menu_button("Open Recent", |ui| {
+                // The body of `menu_button` only runs while the
+                // submenu is open. Flagging here means AppState
+                // refreshes the on-disk view of these paths on the
+                // frames the user is actually looking — and never
+                // on the render hot path.
+                actions.prune_recents = true;
                 for path in ctx.recent_projects {
                     let label = recent_menu_label(path);
                     if ui
@@ -393,8 +404,9 @@ fn save_menu(
     });
 }
 
-/// File-name (or last two components, if available) for compact menu
-/// labels. The full path appears as hover text.
+/// Compact label for the Open Recent submenu and the "Save (…)"
+/// hint: just the file name. The full path is available on hover
+/// so users can disambiguate two projects with the same file name.
 fn recent_menu_label(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())

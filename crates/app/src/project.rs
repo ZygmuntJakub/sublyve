@@ -218,17 +218,103 @@ pub fn load_from_path(path: &Path) -> Result<Project> {
     Ok(file.project)
 }
 
-/// Serialize `project` to pretty JSON and write it to `path`.
-pub fn save_to_path(project: &Project, path: &Path) -> Result<()> {
+/// Save `project` to `path` durably:
+///
+/// 1. Serialize and write to a sibling temp file `<name>.tmp.<pid>`.
+/// 2. `fsync` the temp file so its bytes hit disk.
+/// 3. `rename` the temp file over `path` (atomic w.r.t. concurrent
+///    readers within one filesystem).
+/// 4. Best-effort `fsync` the parent directory on Unix so the rename
+///    entry itself survives a power loss.
+///
+/// The temp file's filename carries the process id (matching the
+/// convention used in `thumb_cache::write_cached` and `bundle.rs`) so
+/// two sublyve processes saving the same project — e.g. a CLI launch
+/// running next to a Finder double-click, or a dev-time second
+/// instance — don't truncate each other's temp file via `O_TRUNC`. On
+/// rename failure the temp file is cleaned up rather than leaking
+/// next to the project.
+///
+/// Atomicity caveats:
+/// - `rename(2)` is only atomic when source and target are on the
+///   same filesystem. We always pick a sibling path, so that holds.
+/// - The directory `fsync` is wrapped in `#[cfg(unix)]` because
+///   Windows doesn't expose a way to open a directory as a `File`,
+///   and a handful of exotic filesystems don't implement it either.
+///   Skipping it weakens durability against power loss but not
+///   against process crashes.
+pub fn save_atomic(project: &Project, path: &Path) -> Result<()> {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+
+    let json = serialize(project, path)?;
+
+    let Some(name) = path.file_name() else {
+        // Degenerate path with no file name (e.g. `/`). Fall back to a
+        // direct write — losing atomicity here is preferable to
+        // panicking on user input.
+        return std::fs::write(path, json)
+            .with_context(|| format!("writing {}", path.display()));
+    };
+
+    let tmp = path.with_file_name(format!(
+        "{}.tmp.{}",
+        name.to_string_lossy(),
+        std::process::id(),
+    ));
+
+    // Write + fsync the temp file inside a scope so the handle drops
+    // (and flushes) before we rename.
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(json.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsyncing {}", tmp.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e).context(format!(
+            "renaming {} → {}",
+            tmp.display(),
+            path.display()
+        )));
+    }
+
+    // Best-effort directory fsync so the rename entry itself is
+    // durable across power loss. Windows can't `open` a directory as
+    // a regular file; some niche filesystems (FAT, exotic FUSE
+    // mounts) return errors here too — we swallow them because the
+    // file data is already on disk and that's the load-bearing part.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let _ = File::open(parent).and_then(|d| d.sync_all());
+    }
+
+    Ok(())
+}
+
+/// Serialize a `Project` to pretty JSON, wrapped in `ProjectFile` so
+/// the on-disk shape carries a version tag. Errors are contextualised
+/// with the target path so log lines tell you which save failed.
+fn serialize(project: &Project, path: &Path) -> Result<String> {
     let file = ProjectFile {
         version: CURRENT_VERSION,
         project: project.clone(),
     };
-    let json = serde_json::to_string_pretty(&file)
-        .with_context(|| format!("serializing project for {}", path.display()))?;
-    std::fs::write(path, json)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    serde_json::to_string_pretty(&file)
+        .with_context(|| format!("serializing project for {}", path.display()))
 }
 
 /// Walk a `Library` and emit a `CellSpec` for every occupied cell.
@@ -453,13 +539,23 @@ mod tests {
     }
 
     #[test]
-    fn loader_round_trips_through_disk() {
+    fn save_atomic_round_trips_and_cleans_up_tmp() {
         let project = sample_project();
         let dir = tempdir_path();
-        let path = dir.join("ok.sublyve.json");
-        save_to_path(&project, &path).expect("save");
+        // Unique filename so parallel test runs don't collide.
+        let path = dir.join(format!("atomic-{}.sublyve.json", std::process::id()));
+        save_atomic(&project, &path).expect("save_atomic");
         let loaded = load_from_path(&path).expect("load");
         assert_eq!(loaded, project);
+
+        // No `<name>.tmp.<pid>` should remain after a successful save.
+        let tmp = path.with_file_name(format!(
+            "{}.tmp.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id(),
+        ));
+        assert!(!tmp.exists(), "tmp file should be renamed away, not left behind");
+
         let _ = std::fs::remove_file(&path);
     }
 
