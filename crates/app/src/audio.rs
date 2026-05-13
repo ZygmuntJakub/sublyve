@@ -457,8 +457,19 @@ fn mix(
         // either case we still drain the ring + advance the consumed
         // counter so the video pump keeps rolling — that way un-soloing
         // (or un-muting) resumes cleanly instead of jumping forward.
+        //
+        // Two Relaxed loads (`is_muted`, then `is_soloed`) can tear if
+        // the user toggles one between them — bounded to one callback
+        // (~10 ms) of slightly wrong gating, which is below perception.
+        // No stronger ordering would close the gap with the prior
+        // `any_solo` load anyway, so don't reach for SeqCst.
         let silenced = src.control.is_muted() || (any_solo && !src.control.is_soloed());
         if silenced {
+            // Take cap matches the *active* branch below
+            // (`output.len().min(scratch.len())`) — load-bearing: if
+            // silenced sources drained at scratch length while active
+            // sources drained at output length, mute/solo toggles
+            // would race the video pump's clock forward.
             let take = output.len().min(scratch.len());
             let popped = src.consumer.pop_slice(&mut scratch[..take]);
             advance_consumed(&src.control, popped, channels);

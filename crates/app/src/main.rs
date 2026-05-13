@@ -1024,7 +1024,7 @@ impl AppState {
                 opacity: l.opacity,
                 master: l.master,
                 mute: l.mute,
-                solo: l.solo,
+                solo: l.is_solo(),
                 playing: l.transport.playing,
                 looping: l.transport.looping,
                 speed: l.transport.speed,
@@ -1207,6 +1207,12 @@ impl AppState {
         if let Some((i, mute)) = actions.set_layer_mute
             && let Some(l) = self.composition.layers.get_mut(i) {
                 l.set_mute(mute);
+                // Muting (or unmuting) a soloed layer changes whether
+                // the composition has any *audible* soloed layer — if
+                // the only soloed layer just went silent we must
+                // release the aggregate so the rest of the composition
+                // returns.
+                self.composition.recompute_solo();
             }
         if let Some((i, solo)) = actions.set_layer_solo {
             self.composition.set_layer_solo(i, solo);
@@ -1657,7 +1663,12 @@ impl AppState {
             layer.set_master(spec.master);
         }
         // Refresh the shared `any_solo_active` aggregate after the
-        // batch of per-layer settings.
+        // batch of per-layer settings. Note: every layer is still
+        // empty at this point (clips are imported in the next loop),
+        // so the empty-layer rule will compute `any_solo_active=false`
+        // even when specs have `solo=true`. That's intentional —
+        // `trigger()` re-fires `recompute_solo` once a clip lands on a
+        // soloed layer, at which point the aggregate flips on.
         self.composition.recompute_solo();
 
         // Library: import every saved cell. Each call decodes a
@@ -1756,7 +1767,7 @@ impl AppState {
                 mute: l.mute,
                 audio_gain: l.audio_gain(),
                 master: l.master,
-                solo: l.solo,
+                solo: l.is_solo(),
             })
             .collect();
         project::Project {

@@ -49,14 +49,24 @@ impl Composition {
 
     /// Recompute the shared `any_solo_active` atomic from the current
     /// per-layer `solo` flags. Must be called after any mutation that
-    /// adds/removes layers or flips a `solo` flag.
+    /// adds/removes layers, flips a `solo` flag, or flips a `mute`
+    /// flag (muting the only audible soloed layer must release the
+    /// aggregate so the rest of the composition comes back).
     ///
-    /// **Empty layers don't count.** A soloed-but-empty layer would
-    /// otherwise silence + hide every other layer in the composition
-    /// (the soloed slot has nothing to show), which is a footgun. Solo
-    /// on an empty layer is inert until a clip is triggered onto it.
+    /// **Empty *or muted* layers don't count.** A soloed-but-empty
+    /// layer would otherwise silence + hide every other layer in the
+    /// composition (the soloed slot has nothing to show); a
+    /// soloed-but-muted layer would do the same with mute winning over
+    /// its own solo. Solo on an empty *or muted* layer is inert until
+    /// the condition lifts (clip triggered, or un-muted).
     pub fn recompute_solo(&self) {
-        let any = self.layers.iter().any(|l| l.solo && !l.is_empty());
+        let any = any_solo_engaged(
+            self.layers.iter().map(|l| LayerSoloState {
+                solo: l.is_solo(),
+                empty: l.is_empty(),
+                muted: l.mute,
+            }),
+        );
         self.any_solo_active.store(any, Ordering::Relaxed);
     }
 
@@ -123,5 +133,66 @@ impl Composition {
         for layer in &mut self.layers {
             layer.restart();
         }
+    }
+}
+
+/// Slice of per-layer state that `any_solo_engaged` reads. Exposed only
+/// so the predicate can be unit-tested without spinning up a GPU.
+struct LayerSoloState {
+    solo: bool,
+    empty: bool,
+    muted: bool,
+}
+
+/// Pure-function form of the solo-aggregate rule: at least one layer is
+/// soloed *and* has a clip *and* isn't currently muted. Kept separate
+/// from `Composition::recompute_solo` so the rule can be exercised
+/// without the wgpu setup `Composition::new` requires.
+fn any_solo_engaged(layers: impl IntoIterator<Item = LayerSoloState>) -> bool {
+    layers
+        .into_iter()
+        .any(|l| l.solo && !l.empty && !l.muted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(solo: bool, empty: bool, muted: bool) -> LayerSoloState {
+        LayerSoloState { solo, empty, muted }
+    }
+
+    #[test]
+    fn soloed_non_empty_non_muted_layer_engages_solo() {
+        assert!(any_solo_engaged([s(true, false, false), s(false, false, false)]));
+    }
+
+    #[test]
+    fn muting_the_only_soloed_layer_disengages_solo() {
+        // The bug this guards: solo + mute on the same layer would
+        // otherwise leave `any_solo_active=true` while the layer is
+        // silent — every other layer gets gated off and the stage
+        // goes dark.
+        assert!(!any_solo_engaged([s(true, false, true), s(false, false, false)]));
+    }
+
+    #[test]
+    fn soloed_but_empty_layer_is_inert() {
+        assert!(!any_solo_engaged([s(true, true, false), s(false, false, false)]));
+    }
+
+    #[test]
+    fn one_audible_solo_among_many_engages() {
+        assert!(any_solo_engaged([
+            s(true, false, true),  // soloed + muted — doesn't count
+            s(true, true, false),  // soloed + empty — doesn't count
+            s(true, false, false), // soloed + audible — this is the one
+            s(false, false, false),
+        ]));
+    }
+
+    #[test]
+    fn no_solos_means_disengaged() {
+        assert!(!any_solo_engaged([s(false, false, false), s(false, true, false)]));
     }
 }

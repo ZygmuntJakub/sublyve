@@ -35,7 +35,12 @@ pub struct Layer {
     /// composition has `solo=true`, every non-soloed layer is silenced
     /// (audio) and skipped from rendering (video). Multiple layers can
     /// be soloed at once (additive solo). Mute always wins over solo.
-    pub solo: bool,
+    ///
+    /// Private: every mutation must funnel through
+    /// `Composition::set_layer_solo` (or a batch followed by
+    /// `Composition::recompute_solo`) so the shared aggregate stays in
+    /// sync. Reads go through [`Layer::is_solo`].
+    solo: bool,
 
     /// Column of the currently-loaded clip (or `None` if the layer is empty).
     pub active_col: Option<usize>,
@@ -250,13 +255,19 @@ impl Layer {
         self.worker.is_none()
     }
 
+    pub fn is_solo(&self) -> bool {
+        self.solo
+    }
+
     /// `any_solo` is the composition-wide "is at least one layer
-    /// soloed" flag, threaded down from `Composition::render`. When it
-    /// is true, only soloed layers stay visible; otherwise solo is
-    /// inert and every non-muted, non-empty, non-faded layer renders.
+    /// soloed" flag, threaded down from `Composition::render`. Loaded
+    /// once by the caller so every layer in the same render pass sees
+    /// the same snapshot. When it is true, only soloed layers stay
+    /// visible; otherwise solo is inert and every non-muted, non-empty,
+    /// non-faded layer renders.
     pub fn is_visible(&self, any_solo: bool) -> bool {
         !self.mute
-            && (!any_solo || self.solo)
+            && (!any_solo || self.is_solo())
             && !self.is_empty()
             && self.opacity * self.master > 0.001
     }
@@ -462,11 +473,13 @@ impl Layer {
         }
     }
 
-    /// Set the solo flag. The composition-wide aggregate is recomputed
-    /// by `Composition::set_layer_solo`; this method just updates the
-    /// per-layer state (visual side) and propagates to the
+    /// Set the solo flag. **Crate-private:** the composition-wide
+    /// aggregate is recomputed by `Composition::set_layer_solo` (or by
+    /// a batch caller followed by `Composition::recompute_solo`).
+    /// Reaching past those entry points leaves `any_solo_active` stale.
+    /// This method updates the per-layer state and propagates to the
     /// `AudioLayerControl` atomic so the audio thread sees it.
-    pub fn set_solo(&mut self, solo: bool) {
+    pub(crate) fn set_solo(&mut self, solo: bool) {
         self.solo = solo;
         if let Some(a) = self.audio.as_ref() {
             a.control.set_soloed(solo);
