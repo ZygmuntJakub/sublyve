@@ -285,10 +285,15 @@ struct AppState {
     /// switching only — config-style tabs.
     right_tab: ui::RightTab,
 
-    /// Live capture devices enumerated at startup and on Refresh. The
-    /// Camera tab in the bottom panel renders this list as drag
-    /// sources; project-load matches saved camera cells against it.
+    /// Live capture devices enumerated at startup and whenever the OS
+    /// signals a hotplug. The Camera tab in the bottom panel renders
+    /// this list as drag sources; project-load matches saved camera
+    /// cells against it.
     cameras: Vec<CameraDevice>,
+
+    /// OS-level hotplug signal. We drain it each tick and re-enumerate
+    /// cameras if anything came through.
+    camera_hotplug: avengine_playback::CameraHotplugWatcher,
 }
 
 struct ControlWindow {
@@ -463,6 +468,7 @@ impl AppState {
                 warn!("camera enumeration failed at startup: {e:#}");
                 Vec::new()
             }),
+            camera_hotplug: avengine_playback::hotplug::watch(),
         };
 
         // Decide whether to auto-load a project. CLI args win over the
@@ -698,8 +704,9 @@ impl AppState {
         Ok(())
     }
 
-    /// Re-enumerate camera devices. Called from the Camera tab's
-    /// Refresh button (and at startup via `AppState::new`).
+    /// Re-enumerate camera devices. Called from `tick()` whenever the
+    /// OS hotplug watcher reports a connect/disconnect, and at startup
+    /// via `AppState::new`.
     fn refresh_cameras(&mut self) {
         match avengine_playback::cameras::list() {
             Ok(list) => {
@@ -870,6 +877,13 @@ impl AppState {
         let now = Instant::now();
         let dt = (now - self.last_tick).as_secs_f64().min(MAX_CATCHUP_SECS);
         self.last_tick = now;
+
+        // OS-driven hotplug: if a camera was plugged or unplugged
+        // since the last frame, re-enumerate. Cheap when nothing
+        // changed (a non-blocking try_recv on an empty channel).
+        if self.camera_hotplug.changed() {
+            self.refresh_cameras();
+        }
 
         self.composition.tick(&self.gpu, dt);
         // Pump the off-output preview deck so the Cue pane shows live
@@ -1263,9 +1277,6 @@ impl AppState {
 
         if let Some((row, col)) = actions.browse_for_cell {
             self.browse_into_cell(row, col);
-        }
-        if actions.refresh_cameras {
-            self.refresh_cameras();
         }
         if let Some((row, col, format_name, device, display_name, has_audio)) =
             actions.bind_camera_to_cell

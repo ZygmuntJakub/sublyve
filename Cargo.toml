@@ -21,6 +21,14 @@ winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 ffmpeg-next = "8"
+objc2-foundation = { version = "0.3", features = [
+    "block2",
+    "NSNotification",
+    "NSOperation",
+    "NSRunLoop",
+    "NSString",
+] }
+block2 = "0.6"
 egui = "0.30"
 egui-wgpu = "0.30"
 egui-winit = "0.30"
