@@ -20,7 +20,18 @@ pub struct AppConfig {
     /// Path of the last project the user saved or opened. Cleared on
     /// load if it no longer resolves on disk.
     pub last_project: Option<PathBuf>,
+    /// Most-recently-used project paths, front = most recent. Capped
+    /// at `MAX_RECENT_PROJECTS`. Entries that no longer resolve on
+    /// disk are pruned lazily — either when the file is loaded or
+    /// just before the recent-files submenu is rendered.
+    #[serde(default)]
+    pub recent_projects: Vec<PathBuf>,
 }
+
+/// How many recent project entries we surface in the menu. Small
+/// enough to fit in a glance, large enough to span a session's worth
+/// of switching between projects.
+pub const MAX_RECENT_PROJECTS: usize = 8;
 
 impl AppConfig {
     /// Load the config file, returning a default if it doesn't exist
@@ -47,6 +58,8 @@ impl AppConfig {
                     );
                     cfg.last_project = None;
                 }
+                cfg.recent_projects.retain(|p| p.exists());
+                cfg.recent_projects.truncate(MAX_RECENT_PROJECTS);
                 cfg
             }
             Err(e) => {
@@ -69,18 +82,91 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Update `last_project` and write the config — best-effort. We log
-    /// errors at warn level rather than propagating, since a failure
-    /// here shouldn't cancel the user's save / open action.
+    /// Update `last_project` and push onto the recent-files list,
+    /// then write the config — best-effort. We log errors at warn
+    /// level rather than propagating, since a failure here shouldn't
+    /// cancel the user's save / open action.
     pub fn remember_project(&mut self, path: &Path) {
         self.last_project = Some(path.to_path_buf());
+        push_recent(&mut self.recent_projects, path);
         if let Err(e) = self.save() {
             warn!("could not persist last_project: {e:#}");
         }
     }
+
+    /// Drop entries from `recent_projects` whose files no longer
+    /// exist on disk and persist the trimmed list. Returns the number
+    /// of entries removed. Called before rendering the recent-files
+    /// submenu so stale entries fade away on their own.
+    pub fn prune_missing_recents(&mut self) -> usize {
+        let before = self.recent_projects.len();
+        self.recent_projects.retain(|p| p.exists());
+        let removed = before - self.recent_projects.len();
+        if removed > 0
+            && let Err(e) = self.save()
+        {
+            warn!("could not persist pruned recent_projects: {e:#}");
+        }
+        removed
+    }
+
+    /// Wipe the recent-projects list. Triggered from the "Clear
+    /// recent files" menu entry.
+    pub fn clear_recent_projects(&mut self) {
+        if self.recent_projects.is_empty() {
+            return;
+        }
+        self.recent_projects.clear();
+        if let Err(e) = self.save() {
+            warn!("could not persist cleared recent_projects: {e:#}");
+        }
+    }
+}
+
+/// Move-to-front + dedupe + cap. Pulled out as a free function so
+/// `AppConfig::remember_project` stays a one-liner and the behavior
+/// is straightforward to unit-test in isolation.
+fn push_recent(list: &mut Vec<PathBuf>, path: &Path) {
+    list.retain(|p| p != path);
+    list.insert(0, path.to_path_buf());
+    list.truncate(MAX_RECENT_PROJECTS);
 }
 
 fn config_path() -> Option<PathBuf> {
     let dir = dirs::config_dir()?;
     Some(dir.join("sublyve").join("config.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn push_recent_moves_to_front() {
+        let mut list = vec![p("/a"), p("/b"), p("/c")];
+        push_recent(&mut list, &p("/c"));
+        assert_eq!(list, vec![p("/c"), p("/a"), p("/b")]);
+    }
+
+    #[test]
+    fn push_recent_dedupes() {
+        let mut list = vec![p("/a"), p("/b")];
+        push_recent(&mut list, &p("/a"));
+        push_recent(&mut list, &p("/a"));
+        assert_eq!(list, vec![p("/a"), p("/b")]);
+    }
+
+    #[test]
+    fn push_recent_caps_to_max() {
+        let mut list = Vec::new();
+        for i in 0..(MAX_RECENT_PROJECTS + 5) {
+            push_recent(&mut list, &p(&format!("/p{i}")));
+        }
+        assert_eq!(list.len(), MAX_RECENT_PROJECTS);
+        assert_eq!(list[0], p(&format!("/p{}", MAX_RECENT_PROJECTS + 4)));
+    }
 }
