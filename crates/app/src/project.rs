@@ -218,13 +218,20 @@ pub fn load_from_path(path: &Path) -> Result<Project> {
     Ok(file.project)
 }
 
-/// Serialize `project` to pretty JSON and write it to `path`.
-pub fn save_to_path(project: &Project, path: &Path) -> Result<()> {
+/// Serialize `project` to pretty JSON wrapped in the versioned envelope.
+/// Used both for plain `.sublyve.json` writes and for the project entry
+/// inside a `.sublyve` bundle (see `bundle::save_to_path`).
+pub fn to_versioned_json(project: &Project) -> Result<String> {
     let file = ProjectFile {
         version: CURRENT_VERSION,
         project: project.clone(),
     };
-    let json = serde_json::to_string_pretty(&file)
+    serde_json::to_string_pretty(&file).context("serializing project")
+}
+
+/// Serialize `project` to pretty JSON and write it to `path`.
+pub fn save_to_path(project: &Project, path: &Path) -> Result<()> {
+    let json = to_versioned_json(project)
         .with_context(|| format!("serializing project for {}", path.display()))?;
     std::fs::write(path, json)
         .with_context(|| format!("writing {}", path.display()))?;
