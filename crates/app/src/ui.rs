@@ -288,7 +288,7 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(
-                    "Click=trigger · Shift+click=cue · Right-click=stop / browse · Enter=Take",
+                    "Click=trigger · Shift+click=cue · Right-click=stop/browse · Enter=Take",
                 )
                 .small()
                 .weak(),
@@ -962,7 +962,7 @@ fn clip_metadata_inspector(
             if !slot.source.is_live() {
                 ui.add_space(6.0);
                 if ui
-                    .button(egui::RichText::new("📂  Replace…").small())
+                    .button("📂  Replace…")
                     .on_hover_text("Pick a different video file for this cell")
                     .clicked()
                 {
@@ -1327,14 +1327,19 @@ fn cell_widget(
             actions.trigger_cell = Some((row, col));
         }
     }
-    if clip.is_some() {
-        if response.secondary_clicked() {
-            actions.stop_layer_at = Some((row, col));
-        }
-    } else {
+    // Right-click on a filled cell stops the layer. The two intents
+    // (fire-an-action vs open-a-menu) are kept as separate top-level
+    // checks so a future context menu on filled cells (Remove / Reveal /
+    // Replace) can slot in without rewriting the discriminant.
+    if response.secondary_clicked() && clip.is_some() {
+        actions.stop_layer_at = Some((row, col));
+    }
+    if clip.is_none() {
         // Empty cell: right-click opens a small context menu so the
         // native picker is discoverable even without first cueing the
         // slot. Drag-drop stays as the fast path.
+        // TODO(multi-select): drag-drop already supports multiple paths;
+        // rfd::FileDialog::pick_files() could match the affordance.
         response.context_menu(|ui| {
             if ui.button("📂  Browse for clip…").clicked() {
                 actions.browse_for_cell = Some((row, col));
