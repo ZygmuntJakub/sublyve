@@ -9,6 +9,7 @@ mod project;
 mod thumb_cache;
 mod thumbs;
 mod ui;
+mod undo;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -303,6 +304,22 @@ struct AppState {
     /// OS-level hotplug signal. We drain it each tick and re-enumerate
     /// cameras if anything came through.
     camera_hotplug: avengine_playback::CameraHotplugWatcher,
+
+    /// Bounded, session-scoped undo / redo for library edits — every
+    /// `library.set` (place / replace), `library.clear`, and per-clip
+    /// default change funnels through one of the `record_*` helpers.
+    /// Cleared on project load and on structural grid changes
+    /// (`remove_layer` / `remove_column`) that would invalidate
+    /// stored coordinates. See `undo.rs` for the slot-preserving
+    /// design.
+    undo_history: undo::History,
+
+    /// True while a "bulk reload" path is running (project load, CLI
+    /// bootstrap). `import_clip` / `import_camera` and friends check
+    /// this and skip recording undo ops while it's set — the user
+    /// shouldn't be able to "undo" individual cells out of a loaded
+    /// project.
+    suppress_undo: bool,
 }
 
 struct ControlWindow {
@@ -486,6 +503,8 @@ impl AppState {
                 Vec::new()
             }),
             camera_hotplug: avengine_playback::hotplug::watch(),
+            undo_history: undo::History::new(),
+            suppress_undo: false,
         };
 
         // Decide whether to auto-load a project. CLI args win over the
@@ -520,7 +539,10 @@ impl AppState {
             }
         } else {
             // CLI clips path: preload into row 0 left-to-right, then
-            // activate the first one on layer 0.
+            // activate the first one on layer 0. This is initial
+            // setup — not user edits — so don't pollute the undo
+            // stack with the bootstrap imports.
+            state.suppress_undo = true;
             for path in &cli.clips {
                 if let Some((row, col)) = state.library.first_empty() {
                     if let Err(e) = state.import_clip(path.clone(), row, col) {
@@ -531,6 +553,7 @@ impl AppState {
                     break;
                 }
             }
+            state.suppress_undo = false;
             // Trigger the freshly-imported clip on layer 0 (CLI clips
             // can only be files, so File-source dispatch only).
             if let Some(slot) = state.library.cell(0, 0)
@@ -665,8 +688,11 @@ impl AppState {
         }
     }
 
-    /// Decode a thumbnail and place a clip slot at `(row, col)`. Frees any
-    /// previous occupant's egui texture id.
+    /// Decode a thumbnail and place a clip slot at `(row, col)`. The
+    /// previous occupant (if any) is handed to the undo history along
+    /// with the recorded `Place` / `Replace` op — its texture won't
+    /// be freed until that op falls off the cap or the redo tail is
+    /// truncated.
     fn import_clip(&mut self, path: PathBuf, row: usize, col: usize) -> Result<()> {
         let mut slot = ClipSlot::from_path(path.clone());
 
@@ -684,10 +710,8 @@ impl AppState {
             Err(e) => warn!("thumbnail for {} failed: {e:#}", path.display()),
         }
 
-        if let Some(prev) = self.library.set(row, col, slot)
-            && let Some(id) = prev.thumbnail_id {
-                self.control.egui_renderer.free_texture(&id);
-            }
+        let displaced = self.library.set(row, col, slot);
+        self.record_place(row, col, displaced);
         info!("imported [{}, {}] {}", row, col, path.display());
         Ok(())
     }
@@ -710,11 +734,8 @@ impl AppState {
             display_name.clone(),
             has_audio,
         );
-        if let Some(prev) = self.library.set(row, col, slot)
-            && let Some(id) = prev.thumbnail_id
-        {
-            self.control.egui_renderer.free_texture(&id);
-        }
+        let displaced = self.library.set(row, col, slot);
+        self.record_place(row, col, displaced);
         info!(
             "imported camera [{}, {}] {} ({}, audio={})",
             row, col, display_name, device, has_audio,
@@ -1102,6 +1123,10 @@ impl AppState {
             cameras: &self.cameras,
             recent_projects: &self.config.recent_projects,
             current_project_path: self.current_project_path.as_ref(),
+            can_undo: self.undo_history.can_undo(),
+            can_redo: self.undo_history.can_redo(),
+            undo_label: self.undo_history.peek_undo(),
+            redo_label: self.undo_history.peek_redo(),
         };
         let actions = ui::draw_control(&self.control.egui_ctx, ui_ctx);
 
@@ -1349,17 +1374,39 @@ impl AppState {
         if let Some(((r, c), looping)) = actions.set_clip_default_loop
             && let Some(slot) = self.library.cell_mut(r, c)
         {
+            let before = slot.defaults;
             slot.defaults.looping = looping;
+            let after = slot.defaults;
+            if before != after {
+                self.record_defaults(r, c, before, after);
+            }
         }
         if let Some(((r, c), speed)) = actions.set_clip_default_speed
             && let Some(slot) = self.library.cell_mut(r, c)
         {
+            let before = slot.defaults;
             slot.defaults.speed = speed;
+            let after = slot.defaults;
+            if before != after {
+                self.record_defaults(r, c, before, after);
+            }
         }
         if let Some(((r, c), blend)) = actions.set_clip_default_blend
             && let Some(slot) = self.library.cell_mut(r, c)
         {
+            let before = slot.defaults;
             slot.defaults.blend = blend;
+            let after = slot.defaults;
+            if before != after {
+                self.record_defaults(r, c, before, after);
+            }
+        }
+
+        if actions.undo {
+            self.undo();
+        }
+        if actions.redo {
+            self.redo();
         }
 
         if actions.save_project
@@ -1544,6 +1591,18 @@ impl AppState {
             }
         }
 
+        // Dropping a row shifts no coordinates (we always drop the
+        // highest-indexed row), but any history op pointing at a
+        // cell in the dropped row would now be a no-op on undo and
+        // — worse — would resurrect a slot whose layer no longer
+        // exists. Wipe the stack; it's the safest path. Defaults
+        // ops + ops on cells in surviving rows are wiped along with
+        // the rest, but that's the cost of a structural edit.
+        let ids = self.undo_history.clear();
+        for id in ids {
+            self.control.egui_renderer.free_texture(&id);
+        }
+
         // Repair UI / state references to the dropped row.
         if self.selected_layer == Some(removed_idx) {
             self.selected_layer = if removed_idx > 0 {
@@ -1610,6 +1669,13 @@ impl AppState {
         {
             self.hovered_cell = None;
         }
+
+        // Same rationale as `remove_layer`: dropped column invalidates
+        // any history op pointing at it. Wipe the stack.
+        let ids = self.undo_history.clear();
+        for id in ids {
+            self.control.egui_renderer.free_texture(&id);
+        }
     }
 
     /// Tear down + rebuild the audio stream on whatever device is
@@ -1622,6 +1688,105 @@ impl AppState {
             .switch_device(&mut self.composition.layers, device.as_deref())
         {
             warn!("audio rebuild after layer count change failed: {e:#}");
+        }
+    }
+
+    /// Record a `Place` / `Replace` op for a `library.set` that just
+    /// ran, freeing any textures the history drops (cap overflow or
+    /// truncated redo tail). No-op when `suppress_undo` is set
+    /// (bulk reload paths) — in that mode the `displaced` slot is
+    /// freed inline instead, since it isn't going into history.
+    fn record_place(&mut self, row: usize, col: usize, displaced: Option<ClipSlot>) {
+        if self.suppress_undo {
+            if let Some(prev) = displaced
+                && let Some(id) = prev.thumbnail_id
+            {
+                self.control.egui_renderer.free_texture(&id);
+            }
+            return;
+        }
+        let freed = self.undo_history.record_place(row, col, displaced);
+        for id in freed {
+            self.control.egui_renderer.free_texture(&id);
+        }
+    }
+
+    /// Record a `Clear` op for a `library.clear` that just returned
+    /// `Some(slot)`, freeing any textures the history drops. No-op
+    /// when `suppress_undo` is set.
+    ///
+    /// Currently unused at runtime: the only existing call site that
+    /// removes single cells is `clear_workspace`, which suppresses
+    /// undo as part of a bulk reload. Kept ready for when a per-cell
+    /// "remove this clip from the library" UI action is added.
+    #[allow(dead_code)]
+    fn record_clear(&mut self, row: usize, col: usize, removed: ClipSlot) {
+        if self.suppress_undo {
+            if let Some(id) = removed.thumbnail_id {
+                self.control.egui_renderer.free_texture(&id);
+            }
+            return;
+        }
+        let freed = self.undo_history.record_clear(row, col, removed);
+        for id in freed {
+            self.control.egui_renderer.free_texture(&id);
+        }
+    }
+
+    /// Record a per-clip defaults change. The chokepoint coalesces
+    /// consecutive same-cell edits within a short window, so a
+    /// slider drag through 100 values lands as one undo op.
+    fn record_defaults(
+        &mut self,
+        row: usize,
+        col: usize,
+        before: library::ClipDefaults,
+        after: library::ClipDefaults,
+    ) {
+        if self.suppress_undo {
+            return;
+        }
+        // Defaults ops never own a texture, so the freed list is
+        // always empty — but keep the same shape as the cell paths
+        // in case a future variant changes that.
+        let freed = self.undo_history.record_defaults(row, col, before, after);
+        for id in freed {
+            self.control.egui_renderer.free_texture(&id);
+        }
+    }
+
+    /// Apply one undo step, if any. Frees any textures the dropped
+    /// slot was holding (they were re-installed in the library on
+    /// undo's behalf, so this is only for displaced slots — usually
+    /// empty for a simple place-then-undo).
+    fn undo(&mut self) {
+        let Some(label) = self.undo_history.peek_undo() else {
+            info!("nothing to undo");
+            return;
+        };
+        if self.undo_history.undo(&mut self.library).is_some() {
+            info!("undo: {label}");
+            // An undo can re-install a slot that was holding the
+            // active clip on a layer playing from `(row, col)`. The
+            // layer's decoder still references the OLD slot, not the
+            // newly-installed one, which is fine for files (the
+            // layer owns its own decoder) but means the visible
+            // "active clip" badge can mismatch the cell. We don't
+            // try to chase the layer state — undo is a *library*
+            // operation, not a transport operation, per the design
+            // notes. The user can re-trigger if they want the layer
+            // to play the restored clip.
+        }
+    }
+
+    /// Apply one redo step, if any.
+    fn redo(&mut self) {
+        let Some(label) = self.undo_history.peek_redo() else {
+            info!("nothing to redo");
+            return;
+        };
+        if self.undo_history.redo(&mut self.library).is_some() {
+            info!("redo: {label}");
         }
     }
 
@@ -1646,6 +1811,13 @@ impl AppState {
                 }
             }
         }
+        // The undo stack is *session* state — it should not survive
+        // a project load. Drop every stored op and free the textures
+        // they were holding onto.
+        let ids = self.undo_history.clear();
+        for id in ids {
+            self.control.egui_renderer.free_texture(&id);
+        }
     }
 
     /// Apply a loaded `project::Project` onto the live `AppState`.
@@ -1653,6 +1825,17 @@ impl AppState {
     /// importing each cell via `import_clip`, applying per-layer
     /// settings, and reconfiguring output / audio.
     fn apply_project(&mut self, project: project::Project) -> Result<()> {
+        // Project apply is a bulk reload, not user-initiated cell
+        // edits — suppress undo recording for its duration so the
+        // history doesn't fill with one op per imported cell. The
+        // history was already drained by `clear_workspace` below.
+        self.suppress_undo = true;
+        let result = self.apply_project_inner(project);
+        self.suppress_undo = false;
+        result
+    }
+
+    fn apply_project_inner(&mut self, project: project::Project) -> Result<()> {
         self.clear_workspace();
 
         // Resize the composition target if the project asks for a

@@ -160,6 +160,12 @@ pub struct UiActions {
     /// cell to that camera. Auto-triggers if the layer was empty.
     /// Tuple: `(row, col, format_name, device, display_name, has_audio)`.
     pub bind_camera_to_cell: Option<(usize, usize, String, String, String, bool)>,
+    /// `↶ Undo` action — Cmd+Z or the Edit menu entry. No-op when
+    /// the history stack is empty.
+    pub undo: bool,
+    /// `↷ Redo` action — Cmd+Shift+Z or the Edit menu entry. No-op
+    /// when there's nothing to redo.
+    pub redo: bool,
 }
 
 pub struct UiContext<'a> {
@@ -196,6 +202,16 @@ pub struct UiContext<'a> {
     /// Path of the project currently being edited, if any. Powers
     /// the `💾 Save` menu entry's enabled state + tooltip.
     pub current_project_path: Option<&'a PathBuf>,
+    /// Whether there's at least one library edit to undo — drives
+    /// the `↶ Undo` menu entry's enabled state.
+    pub can_undo: bool,
+    /// Whether there's at least one library edit to redo.
+    pub can_redo: bool,
+    /// Short label of the next-to-undo op ("place" / "replace" /
+    /// "clear" / "defaults"), shown in the menu entry tooltip.
+    pub undo_label: Option<&'static str>,
+    /// Short label of the next-to-redo op, ditto.
+    pub redo_label: Option<&'static str>,
 }
 
 pub fn draw_control(ctx: &egui::Context, ui_ctx: UiContext<'_>) -> UiActions {
@@ -295,13 +311,25 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
         egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
         egui::Key::S,
     );
-    // Order matters: Cmd+Shift+S also satisfies the Cmd+S modifier
-    // mask, so we check the more-specific binding first.
+    let undo_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+    let redo_shortcut = egui::KeyboardShortcut::new(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::Z,
+    );
+    // Order matters for both Save and Undo: Cmd+Shift+<key> also
+    // matches the Cmd+<key> modifier mask, so we check the
+    // more-specific shifted binding first.
     if ui.ctx().input_mut(|i| i.consume_shortcut(&save_as_shortcut)) {
         actions.save_project_as = true;
     }
     if ui.ctx().input_mut(|i| i.consume_shortcut(&save_shortcut)) {
         actions.save_project = true;
+    }
+    if ui.ctx().input_mut(|i| i.consume_shortcut(&redo_shortcut)) {
+        actions.redo = true;
+    }
+    if ui.ctx().input_mut(|i| i.consume_shortcut(&undo_shortcut)) {
+        actions.undo = true;
     }
 
     ui.horizontal(|ui| {
@@ -315,6 +343,7 @@ fn transport_bar(ui: &mut egui::Ui, ctx: &UiContext<'_>, actions: &mut UiActions
         ui.separator();
         open_menu(ui, ctx, actions);
         save_menu(ui, ctx, actions, &save_shortcut, &save_as_shortcut);
+        edit_menu(ui, ctx, actions, &undo_shortcut, &redo_shortcut);
         ui.separator();
         ui.label(format!(
             "{} layer{} · {} active",
@@ -401,6 +430,41 @@ fn save_menu(
             .shortcut_text(ui.ctx().format_shortcut(save_as_shortcut));
         if ui.add(save_as_entry).clicked() {
             actions.save_project_as = true;
+            ui.close_menu();
+        }
+    });
+}
+
+/// `↶ Edit` menu — Undo + Redo for library edits (place, replace,
+/// clear, per-clip default changes). Greyed out when the
+/// corresponding stack is empty; tooltips reveal which kind of op
+/// is at the top of each stack.
+fn edit_menu(
+    ui: &mut egui::Ui,
+    ctx: &UiContext<'_>,
+    actions: &mut UiActions,
+    undo_shortcut: &egui::KeyboardShortcut,
+    redo_shortcut: &egui::KeyboardShortcut,
+) {
+    ui.menu_button("↶  Edit", |ui| {
+        let undo_label = match ctx.undo_label {
+            Some(kind) => format!("Undo  ({kind})"),
+            None => "Undo".to_string(),
+        };
+        let undo_entry = egui::Button::new(undo_label)
+            .shortcut_text(ui.ctx().format_shortcut(undo_shortcut));
+        if ui.add_enabled(ctx.can_undo, undo_entry).clicked() {
+            actions.undo = true;
+            ui.close_menu();
+        }
+        let redo_label = match ctx.redo_label {
+            Some(kind) => format!("Redo  ({kind})"),
+            None => "Redo".to_string(),
+        };
+        let redo_entry = egui::Button::new(redo_label)
+            .shortcut_text(ui.ctx().format_shortcut(redo_shortcut));
+        if ui.add_enabled(ctx.can_redo, redo_entry).clicked() {
+            actions.redo = true;
             ui.close_menu();
         }
     });
