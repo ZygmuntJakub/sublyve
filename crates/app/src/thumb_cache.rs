@@ -79,7 +79,7 @@ pub fn load_or_decode(path: &Path, width: u32, height: u32) -> Result<VideoFrame
         }
     };
 
-    if let Some(key) = &key
+    if let Some(key) = key
         && let Some(path) = cache_path(key)
     {
         match read_cached(&path, width, height) {
@@ -94,7 +94,7 @@ pub fn load_or_decode(path: &Path, width: u32, height: u32) -> Result<VideoFrame
 
     let frame = thumbs::extract_thumbnail(path, width, height)?;
 
-    if let Some(key) = &key
+    if let Some(key) = key
         && let Some(out) = cache_path(key)
     {
         if let Err(e) = write_cached(&out, &frame) {
@@ -191,7 +191,7 @@ impl Fnv1a {
 /// Resolve the cache directory and the file path for a given key. Returns
 /// `None` if the platform doesn't expose a cache dir (very unusual; in
 /// practice macOS/Windows/Linux all do).
-fn cache_path(key: &u64) -> Option<PathBuf> {
+fn cache_path(key: u64) -> Option<PathBuf> {
     let dir = cache_dir()?;
     Some(dir.join(format!("{key:016x}.thumb")))
 }
@@ -244,17 +244,30 @@ fn read_cached(path: &Path, want_w: u32, want_h: u32) -> Result<Option<VideoFram
     Ok(Some(VideoFrame::new(width, height, 0.0, data)))
 }
 
-/// Write `frame` to `path`, creating parent directories as needed. Writes
-/// atomically via a `.tmp` sibling + rename so a crash mid-write can't
-/// leave a half-written file that future loads would treat as a miss
-/// every time.
+/// Write `frame` to `path`, creating parent directories as needed.
+///
+/// Atomic with respect to concurrent readers: we write to a `.tmp` sibling
+/// and then `rename(2)` over the final path, so a reader either sees the
+/// previous entry or the new one — never a half-written file. The tmp name
+/// is suffixed with the current PID so two processes racing on the same
+/// cache key don't clobber each other's tmp file.
+///
+/// This is **not** durable across power loss: we don't `fsync` the file or
+/// the directory before/after rename, so the OS is free to lose the entry
+/// on a crash. The cost of a lost entry is one extra FFmpeg decode on the
+/// next project load, which is exactly what this cache exists to avoid but
+/// not a correctness problem — so we skip the syncs for cheaper writes.
 fn write_cached(path: &Path, frame: &VideoFrame) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let tmp = path.with_extension("thumb.tmp");
+    // Per-process tmp suffix avoids two concurrent `import_clip` calls on
+    // the same source file fighting over a shared `<key>.thumb.tmp`. Same
+    // process racing with itself is still possible in theory but vanishingly
+    // unlikely in this codebase (one worker per layer).
+    let tmp = path.with_extension(format!("thumb.tmp.{}", std::process::id()));
     {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
@@ -279,13 +292,18 @@ mod tests {
     fn round_trip_preserves_pixels() {
         let dir = tempdir();
         let path = dir.join("test.thumb");
-        let pixels: Vec<u8> = (0..(4 * 8 * 4) as u8).collect();
-        let frame = VideoFrame::new(4, 8, 0.0, pixels.clone());
+        let (w, h) = (4u32, 8u32);
+        let n = (w * h * 4) as usize;
+        // NB: don't write `(0..(w*h*4) as u8)` — the cast applies to the
+        // range bound, not to each element, and silently truncates if the
+        // total ever exceeds 255.
+        let pixels: Vec<u8> = (0..n).map(|i| i as u8).collect();
+        let frame = VideoFrame::new(w, h, 0.0, pixels.clone());
 
         write_cached(&path, &frame).expect("write");
-        let loaded = read_cached(&path, 4, 8).expect("read").expect("hit");
-        assert_eq!(loaded.width, 4);
-        assert_eq!(loaded.height, 8);
+        let loaded = read_cached(&path, w, h).expect("read").expect("hit");
+        assert_eq!(loaded.width, w);
+        assert_eq!(loaded.height, h);
         assert_eq!(loaded.data, pixels);
     }
 
@@ -305,6 +323,25 @@ mod tests {
             .expect("write garbage");
         let res = read_cached(&path, 4, 4).expect("not an i/o error");
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn read_returns_none_for_version_mismatch() {
+        let dir = tempdir();
+        let path = dir.join("oldver.thumb");
+        // Right magic, wrong version. Width/height/payload are valid for
+        // 1x1 RGBA — we want to prove the version check rejects this
+        // *before* dimension/payload checks would.
+        let bogus_version: u32 = FORMAT_VERSION.wrapping_add(1);
+        let mut buf = Vec::with_capacity(HEADER_LEN + 4);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&bogus_version.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // width
+        buf.extend_from_slice(&1u32.to_le_bytes()); // height
+        buf.extend_from_slice(&[0u8; 4]); // one RGBA pixel
+        fs::write(&path, &buf).expect("write");
+        let res = read_cached(&path, 1, 1).expect("not an i/o error");
+        assert!(res.is_none(), "version mismatch must be a miss");
     }
 
     #[test]
